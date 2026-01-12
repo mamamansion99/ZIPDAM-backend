@@ -347,7 +347,7 @@ function handleOrder_(body) {
   let linePush = { attempted: false, ok: false };
   let adminPush = { attempted: false, ok: false };
   try {
-    linePush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, lineUserId, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal) || linePush;
+    linePush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, lineUserId, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address) || linePush;
   } catch (err) {
     console.error('pushLineOrderConfirm_ call failed', err);
     linePush = { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
@@ -355,7 +355,7 @@ function handleOrder_(body) {
   try {
     if (ADMIN_LINE_USER_ID) {
       // Reuse the same messaging token/settings as customer confirmation, but deliver to admin userId.
-      adminPush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, ADMIN_LINE_USER_ID, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal) || adminPush;
+      adminPush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, ADMIN_LINE_USER_ID, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address) || adminPush;
     }
   } catch (err) {
     console.error('admin push failed', err);
@@ -464,7 +464,7 @@ function appendOrderItems_(orderId, items) {
   }
 }
 
-function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, shippingFee, grandTotal) {
+function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, shippingFee, grandTotal, displayName, address) {
   if (!token) return { attempted: false, ok: false, error: 'Missing LINE_MESSAGING_TOKEN' };
   if (!lineUserId || !String(lineUserId).startsWith('U')) return { attempted: false, ok: false, error: 'Missing/invalid lineUserId' };
 
@@ -487,6 +487,8 @@ function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, sh
     const text = [
       '🧾 ยืนยันคำสั่งซื้อ ZIPDAM',
       `Order: ${orderId}`,
+      `ลูกค้า: ${displayName || '-'}`,
+      `ที่อยู่: ${address || '-'}`,
       '────────────',
       'รายการ:',
       itemLines.join('\n\n'),
