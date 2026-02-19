@@ -7,6 +7,7 @@
  *  - POST {action:"favorites_get|favorites_add|favorites_remove", idToken, item?}
  *  - POST {action:"templates_get|templates_add|templates_delete", idToken, ...}
  *  - POST {action:"frequent_get", idToken, limit}
+ *  - POST {action:"customer_profile|customer_profile_set", idToken?, lineUserId?, ...}
  */
 
 /** ====== CONFIG ====== */
@@ -65,6 +66,7 @@ function doPost(e) {
 
       case 'frequent_get': return json_(handleFrequentGet_(body));
       case 'customer_profile': return json_(handleCustomerProfileGet_(body));
+      case 'customer_profile_set': return json_(handleCustomerProfileSet_(body));
 
       default:
         return json_({ ok: false, error: 'Unknown action (POST)' });
@@ -960,6 +962,20 @@ function handleCustomerProfileGet_(body) {
   const lineUserId = resolveFavoritesUser_(body);
   const profile = getCustomerProfile_(lineUserId);
   return { ok: true, profile };
+}
+
+function handleCustomerProfileSet_(body) {
+  // allow save by provided lineUserId, with idToken verification when available
+  const lineUserId = resolveFavoritesUser_(body);
+  const displayName = String(body.displayName || '').trim();
+  const store = String(body.store || body.storeName || '').trim();
+  const area = String(body.area || body.soi || '').trim();
+  const address = String(body.address || body.defaultAddress || '').trim();
+  const phone = String(body.phone || '').trim();
+
+  upsertCustomer_(lineUserId, displayName, address, phone, store, area);
+  const profile = getCustomerProfile_(lineUserId);
+  return { ok: true, lineUserId, profile };
 }
 
 function getCustomerProfile_(lineUserId) {
