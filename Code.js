@@ -2,7 +2,7 @@
  * ZIPDAM Backend - Google Apps Script Web App
  * Endpoints:
  *  - GET  ?action=catalog
- *  - POST {action:"order", idToken, cart:[{Brand,Size,Name,qty}]}
+ *  - POST {action:"order", idToken, lineUserId, displayName, store, area, address, phone, cart:[{Brand,Size,Name,qty}]}
  *  - POST {action:"me", idToken}
  *  - POST {action:"favorites_get|favorites_add|favorites_remove", idToken, item?}
  *  - POST {action:"templates_get|templates_add|templates_delete", idToken, ...}
@@ -347,7 +347,7 @@ function handleOrder_(body) {
   let linePush = { attempted: false, ok: false };
   let adminPush = { attempted: false, ok: false };
   try {
-    linePush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, lineUserId, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address) || linePush;
+    linePush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, lineUserId, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address, phone) || linePush;
   } catch (err) {
     console.error('pushLineOrderConfirm_ call failed', err);
     linePush = { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
@@ -355,7 +355,7 @@ function handleOrder_(body) {
   try {
     if (ADMIN_LINE_USER_ID) {
       // Reuse the same messaging token/settings as customer confirmation, but deliver to admin userId.
-      adminPush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, ADMIN_LINE_USER_ID, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address) || adminPush;
+      adminPush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, ADMIN_LINE_USER_ID, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address, phone) || adminPush;
     }
   } catch (err) {
     console.error('admin push failed', err);
@@ -464,20 +464,23 @@ function appendOrderItems_(orderId, items) {
   }
 }
 
-function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, shippingFee, grandTotal, displayName, address) {
+function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, shippingFee, grandTotal, displayName, address, phone) {
   if (!token) return { attempted: false, ok: false, error: 'Missing LINE_MESSAGING_TOKEN' };
   if (!lineUserId || !String(lineUserId).startsWith('U')) return { attempted: false, ok: false, error: 'Missing/invalid lineUserId' };
 
   try {
     const lines = Array.isArray(items) ? items : [];
     const itemLines = lines.map((it, idx) => {
-      const namePart = `${it.Brand ? it.Brand + ' ' : ''}${it.Name || ''}`.trim();
-      const packLabel = it.pack ? ` (${it.pack} ชิ้น)` : '';
+      const namePart = `${it.Name || ''}`.trim();
+      const rawSize = String(it.Size || '').trim();
+      const normalizedSize = rawSize.replace(/\s*mm$/i, '').trim();
+      const sizeLabel = normalizedSize ? ` ${normalizedSize}` : '';
+      const packLabel = it.pack ? ` (${it.pack}ชิ้น)` : '';
       const unitLabel = `ราคากล่องละ ${formatTHB_(it.unitPrice)}`;
       const qtyLabel = `จำนวน ${it.qty} กล่อง`;
       const lineTotalLabel = `รวม ${formatTHB_(it.lineTotal)}`;
       return [
-        `${idx + 1}) ${namePart}${packLabel}`,
+        `${idx + 1}) ${namePart}${sizeLabel}${packLabel}`,
         `   📦 ${qtyLabel}`,
         `   💰 ${unitLabel}`,
         `   🔸 ${lineTotalLabel}`
@@ -489,6 +492,7 @@ function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, sh
       `Order: ${orderId}`,
       `ลูกค้า: ${displayName || '-'}`,
       `ที่อยู่: ${address || '-'}`,
+      `โทร: ${phone || '-'}`,
       '────────────',
       'รายการ:',
       itemLines.join('\n\n'),
