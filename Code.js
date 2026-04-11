@@ -19,9 +19,20 @@ function getConfig_() {
   const LINE_MESSAGING_TOKEN = '6W4tvkhwl5GbmBKHLr4D3P5wLhjUaO1Ak5WJYArUZXTehnwHmodl+KJG3GWc6bMfLfzXUVkTWTdrE6IHeQ7Id10/z+/tpN4hLLjyPuh5e2efRC/ADXgjAljHuFwinVGbXNiBylywsemWI3Ikm/YXDQdB04t89/1O/w1cDnyilFU=';
   const N8N_WEBHOOK_URL = 'https://n8n.srv1112305.hstgr.cloud/webhook-test/zipdam';
   const FIXED_SHIPPING = 20;
+  const LOW_ORDER_SHIPPING = 30;
+  const SHIPPING_THRESHOLD = 200;
   const ADMIN_LINE_USER_ID = 'U1d0318233f66c6ddc1fd998e49c5dcef'; // notify admin on new order
 
-  return { SHEET_ID, LINE_LOGIN_CHANNEL_ID, LINE_MESSAGING_TOKEN, N8N_WEBHOOK_URL, FIXED_SHIPPING, ADMIN_LINE_USER_ID };
+  return {
+    SHEET_ID,
+    LINE_LOGIN_CHANNEL_ID,
+    LINE_MESSAGING_TOKEN,
+    N8N_WEBHOOK_URL,
+    FIXED_SHIPPING,
+    LOW_ORDER_SHIPPING,
+    SHIPPING_THRESHOLD,
+    ADMIN_LINE_USER_ID
+  };
 }
 
 function json_(obj, code) {
@@ -241,9 +252,15 @@ function buildProductIndex_() {
   return { idx, skuIdx };
 }
 
+function getShippingFee_(itemsTotal) {
+  const { FIXED_SHIPPING, LOW_ORDER_SHIPPING, SHIPPING_THRESHOLD } = getConfig_();
+  if (toNumber_(itemsTotal) <= 0) return 0;
+  return itemsTotal < SHIPPING_THRESHOLD ? LOW_ORDER_SHIPPING : FIXED_SHIPPING;
+}
+
 /** ====== ORDER HANDLER ====== */
 function handleOrder_(body) {
-  const { FIXED_SHIPPING, LINE_MESSAGING_TOKEN, N8N_WEBHOOK_URL, ADMIN_LINE_USER_ID } = getConfig_();
+  const { LINE_MESSAGING_TOKEN, N8N_WEBHOOK_URL, ADMIN_LINE_USER_ID } = getConfig_();
   const idToken = body.idToken || '';
   const cart = body.cart;
 
@@ -338,7 +355,7 @@ function handleOrder_(body) {
   }
 
   itemsTotal = Math.round(itemsTotal);
-  const shippingFee = FIXED_SHIPPING;
+  const shippingFee = getShippingFee_(itemsTotal);
   const grandTotal = itemsTotal + shippingFee;
 
   const orderId = getNextOrderId_();
