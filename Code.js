@@ -17,6 +17,7 @@
  *   POST {action:"frequent_get", idToken, lineUserId?, limit}
  *   POST {action:"admin_status", idToken, lineUserId}
  *   POST {action:"admin_customers_search", idToken, lineUserId, query}
+ *   POST {action:"admin_customer_create", idToken, lineUserId, displayName, store, area, phone, address}
  *   POST {action:"admin_order", idToken, lineUserId, selectedCustomerId, cart:[...]}
  */
 
@@ -113,6 +114,7 @@ function doPost(e) {
       case 'frequent_get': return json_(handleFrequentGet_(body));
       case 'admin_status': return json_(handleAdminStatus_(body));
       case 'admin_customers_search': return json_(handleAdminCustomersSearch_(body));
+      case 'admin_customer_create': return json_(handleAdminCustomerCreate_(body));
       case 'admin_order': return json_(handleAdminOrder_(body));
       default: return json_({ ok: false, error: 'Unknown POST action.' });
     }
@@ -153,6 +155,10 @@ function nowIso_() {
 
 function isRealLineUserId_(value) {
   return /^U[0-9a-f]{32}$/i.test(text_(value));
+}
+
+function isManualCustomerId_(value) {
+  return /^MANUAL-\d+$/i.test(text_(value));
 }
 
 function parseLineUserIds_(value) {
@@ -549,14 +555,26 @@ function createOrder_(body, identity, options) {
   const cart = Array.isArray(body.cart) ? body.cart : [];
   assert_(cart.length > 0, 'Cart is empty');
 
-  const profile = identity.isGuest ? emptyProfile_() : getCustomerProfile_(identity.lineUserId);
+  const profile = identity.isGuest
+    ? emptyProfile_()
+    : identity.isManual
+      ? getManualCustomerProfile_(identity.customerId)
+      : getCustomerProfile_(identity.lineUserId);
 
   const store = text_(body.store || body.storeName) || profile.store;
   const area = text_(body.area || body.soi) || profile.area;
   const address = text_(body.address || body.defaultAddress) || profile.defaultAddress;
   const phone = normalisePhone_(body.phone) || profile.phone;
 
-  if (!identity.isGuest) {
+  if (identity.isManual) {
+    updateManualCustomer_(identity.customerId, {
+      displayName: identity.displayName,
+      store,
+      area,
+      phone,
+      defaultAddress: address
+    });
+  } else if (!identity.isGuest) {
     upsertCustomer_({
       lineUserId: identity.lineUserId,
       displayName: identity.displayName,
@@ -616,7 +634,7 @@ function createOrder_(body, identity, options) {
     note: text_(body.note),
     createdByLineUserId: settings.createdByLineUserId,
     orderMode,
-    loyaltyStatus: identity.isGuest ? 'EXCLUDED' : 'PENDING',
+    loyaltyStatus: identity.isGuest || identity.isManual ? 'EXCLUDED' : 'PENDING',
     pointsEarned: '',
     rewardApplied: ''
   });
@@ -725,22 +743,26 @@ function handleAdminCustomersSearch_(body) {
   for (let index = rows.length - 1; index >= 0 && customers.length < limit; index -= 1) {
     const row = rows[index];
     const value = header => map[header] ? row[map[header] - 1] : '';
-    const lineUserId = text_(value('lineUserId'));
-    if (!isRealLineUserId_(lineUserId)) continue;
+    const storedLineUserId = text_(value('lineUserId'));
+    const customerId = text_(value('customerId')) || storedLineUserId;
+    const isLinked = isRealLineUserId_(storedLineUserId);
+    const isManual = isManualCustomerId_(customerId);
+    if (!isLinked && !isManual) continue;
 
     const customer = {
-      lineUserId,
-      customerId: lineUserId,
-      displayName: text_(value('displayName') || value('name')) || 'LINE customer',
+      lineUserId: isLinked ? storedLineUserId : '',
+      customerId: isLinked ? storedLineUserId : customerId,
+      displayName: text_(value('displayName') || value('name')) || (isLinked ? 'LINE customer' : 'Manual customer'),
       store: text_(value('store')),
       area: text_(value('area')),
       phone: normalisePhone_(value('phone')),
       defaultAddress: text_(value('defaultAddress')),
-      type: text_(value('type')) || 'LINE',
+      type: text_(value('type')) || (isLinked ? 'LINE' : 'MANUAL'),
       status: text_(value('status')) || 'ACTIVE'
     };
     const haystack = [
       customer.lineUserId,
+      customer.customerId,
       customer.displayName,
       customer.store,
       customer.area,
@@ -753,25 +775,81 @@ function handleAdminCustomersSearch_(body) {
   return { ok: true, customers };
 }
 
+function handleAdminCustomerCreate_(body) {
+  requireAdmin_(body);
+
+  const displayName = text_(body.customerDisplayName || body.customerName);
+  const store = text_(body.store || body.storeName);
+  const area = text_(body.area || body.soi);
+  const phone = normalisePhone_(body.phone);
+  const defaultAddress = text_(body.address || body.defaultAddress);
+
+  assert_(displayName, 'Customer name is required');
+  assert_(store, 'Store is required');
+  assert_(area, 'Area is required');
+  assert_(phone, 'Phone is required');
+
+  const customerId = getNextManualCustomerId_();
+  const now = nowIso_();
+  appendObjectRow_('Customer', {
+    lineUserId: '',
+    customerId,
+    name: displayName,
+    displayName,
+    type: 'MANUAL',
+    store,
+    storeId: '',
+    area,
+    phone,
+    defaultAddress,
+    createdAt: now,
+    lastSeenAt: now,
+    note: '',
+    status: 'ACTIVE',
+    linkedAt: '',
+    loyaltyNote: 'EXCLUDED_UNTIL_LINE_LINKED'
+  }, ZIPDAM_SCHEMA.Customer);
+
+  return {
+    ok: true,
+    customer: {
+      lineUserId: '',
+      customerId,
+      displayName,
+      store,
+      area,
+      phone,
+      defaultAddress,
+      type: 'MANUAL',
+      status: 'ACTIVE'
+    }
+  };
+}
+
 function handleAdminOrder_(body) {
   const adminIdentity = requireAdmin_(body);
   const selectedCustomerId = text_(body.selectedCustomerId);
-  assert_(isRealLineUserId_(selectedCustomerId), 'Select a valid LINE customer');
+  assert_(
+    isRealLineUserId_(selectedCustomerId) || isManualCustomerId_(selectedCustomerId),
+    'Select a valid customer'
+  );
 
-  const customerProfile = getCustomerProfile_(selectedCustomerId);
-  assert_(customerProfile.lineUserId === selectedCustomerId, 'Customer not found');
+  const customerProfile = getAdminCustomerProfile_(selectedCustomerId);
+  assert_(customerProfile.customerId === selectedCustomerId, 'Customer not found');
+  const isManual = isManualCustomerId_(selectedCustomerId);
 
   const customerIdentity = {
-    lineUserId: selectedCustomerId,
+    lineUserId: isManual ? '' : selectedCustomerId,
     customerId: selectedCustomerId,
-    displayName: customerProfile.displayName || 'LINE customer',
+    displayName: customerProfile.displayName || (isManual ? 'Manual customer' : 'LINE customer'),
     tokenVerified: true,
     tokenError: '',
-    isGuest: false
+    isGuest: false,
+    isManual
   };
 
   return createOrder_(Object.assign({}, body, {
-    lineUserId: selectedCustomerId,
+    lineUserId: customerIdentity.lineUserId,
     displayName: customerIdentity.displayName,
     store: text_(body.store) || customerProfile.store,
     area: text_(body.area || body.soi) || customerProfile.area,
@@ -838,6 +916,38 @@ function scanMaxOrderNo_() {
  * CUSTOMER
  * ========================= */
 
+function getNextManualCustomerId_() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    let last = toNumber_(props.getProperty('LAST_MANUAL_CUSTOMER_NO'));
+    last = Math.max(last, scanMaxManualCustomerNo_());
+
+    const next = last + 1;
+    props.setProperty('LAST_MANUAL_CUSTOMER_NO', String(next));
+    return 'MANUAL-' + String(next).padStart(4, '0');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function scanMaxManualCustomerNo_() {
+  const { sheet, map } = assertHeaders_('Customer', ['customerId']);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const values = sheet
+    .getRange(2, map.customerId, lastRow - 1, 1)
+    .getDisplayValues()
+    .flat();
+  return values.reduce((max, value) => {
+    const match = text_(value).match(/^MANUAL-0*(\d+)$/i);
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, 0);
+}
+
 function upsertCustomer_(profile) {
   assert_(isRealLineUserId_(profile.lineUserId), 'Invalid LINE user ID');
 
@@ -899,6 +1009,69 @@ function getCustomerProfile_(lineUserId) {
     defaultAddress: text_(value('defaultAddress')),
     address: text_(value('defaultAddress'))
   };
+}
+
+function getManualCustomerProfile_(customerId) {
+  if (!isManualCustomerId_(customerId)) return emptyProfile_();
+
+  const { sheet, map } = assertHeaders_('Customer', ['lineUserId', 'customerId']);
+  const rowNumber = findRowByValue_(sheet, map.customerId, customerId);
+  if (!rowNumber) return emptyProfile_();
+
+  const row = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const value = header => map[header] ? row[map[header] - 1] : '';
+  if (isRealLineUserId_(value('lineUserId'))) return emptyProfile_();
+
+  return {
+    lineUserId: '',
+    customerId,
+    displayName: text_(value('displayName') || value('name')),
+    store: text_(value('store')),
+    area: text_(value('area')),
+    phone: normalisePhone_(value('phone')),
+    defaultAddress: text_(value('defaultAddress')),
+    address: text_(value('defaultAddress')),
+    type: text_(value('type')) || 'MANUAL',
+    status: text_(value('status')) || 'ACTIVE'
+  };
+}
+
+function getAdminCustomerProfile_(customerId) {
+  return isRealLineUserId_(customerId)
+    ? getCustomerProfile_(customerId)
+    : getManualCustomerProfile_(customerId);
+}
+
+function updateManualCustomer_(customerId, profile) {
+  assert_(isManualCustomerId_(customerId), 'Invalid manual customer ID');
+
+  const { sheet, map } = assertHeaders_('Customer', ['lineUserId', 'customerId']);
+  const rowNumber = findRowByValue_(sheet, map.customerId, customerId);
+  assert_(rowNumber, 'Customer not found');
+
+  const storedLineUserId = text_(sheet.getRange(rowNumber, map.lineUserId).getValue());
+  assert_(!isRealLineUserId_(storedLineUserId), 'Customer is already linked to LINE');
+
+  const data = {
+    customerId,
+    type: 'MANUAL',
+    lastSeenAt: nowIso_(),
+    status: 'ACTIVE',
+    loyaltyNote: 'EXCLUDED_UNTIL_LINE_LINKED'
+  };
+  const contactUpdates = {
+    name: text_(profile.displayName),
+    displayName: text_(profile.displayName),
+    store: text_(profile.store),
+    area: text_(profile.area),
+    phone: normalisePhone_(profile.phone),
+    defaultAddress: text_(profile.defaultAddress)
+  };
+  Object.keys(contactUpdates).forEach(key => {
+    if (contactUpdates[key]) data[key] = contactUpdates[key];
+  });
+  updateObjectRow_(sheet, rowNumber, map, data);
+  return rowNumber;
 }
 
 function emptyProfile_() {

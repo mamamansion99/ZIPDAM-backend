@@ -10,6 +10,7 @@ vm.runInContext(source, context, { filename: "Code.js" });
 const ADMIN_ID = `U${"a".repeat(32)}`;
 const CUSTOMER_ID = `U${"b".repeat(32)}`;
 const OTHER_ID = `U${"c".repeat(32)}`;
+const MANUAL_ID = "MANUAL-0001";
 
 context.getConfig_ = () => ({
   ADMIN_LINE_USER_ID: ADMIN_ID,
@@ -65,8 +66,8 @@ context.createOrder_ = (body, identity, options) => {
   capturedCreate = { body, identity, options };
   return { ok: true, orderId: "ODTEST" };
 };
-context.getCustomerProfile_ = (lineUserId) =>
-  lineUserId === CUSTOMER_ID
+context.getAdminCustomerProfile_ = (customerId) =>
+  customerId === CUSTOMER_ID
     ? {
         lineUserId: CUSTOMER_ID,
         customerId: CUSTOMER_ID,
@@ -90,6 +91,61 @@ assert.equal(capturedCreate.identity.lineUserId, CUSTOMER_ID);
 assert.equal(capturedCreate.identity.customerId, CUSTOMER_ID);
 assert.equal(capturedCreate.options.createdByLineUserId, ADMIN_ID);
 assert.equal(capturedCreate.options.orderMode, "ADMIN");
+
+context.getAdminCustomerProfile_ = (customerId) =>
+  customerId === MANUAL_ID
+    ? {
+        lineUserId: "",
+        customerId: MANUAL_ID,
+        displayName: "Walk-in customer",
+        store: "Manual store",
+        area: "Manual area",
+        phone: "0899999999",
+        defaultAddress: "Manual address",
+      }
+    : { customerId: "" };
+context.handleAdminOrder_({
+  idToken: "admin-token",
+  lineUserId: ADMIN_ID,
+  selectedCustomerId: MANUAL_ID,
+  cart: [{ SKU: "SKU-1", qty: 1 }],
+});
+assert.equal(capturedCreate.identity.lineUserId, "");
+assert.equal(capturedCreate.identity.customerId, MANUAL_ID);
+assert.equal(capturedCreate.identity.isManual, true);
+
+let createdCustomer = null;
+context.getNextManualCustomerId_ = () => MANUAL_ID;
+context.nowIso_ = () => "2026-07-29T00:00:00.000Z";
+context.appendObjectRow_ = (sheetName, customer) => {
+  assert.equal(sheetName, "Customer");
+  createdCustomer = customer;
+};
+const created = context.handleAdminCustomerCreate_({
+  idToken: "admin-token",
+  lineUserId: ADMIN_ID,
+  customerDisplayName: "New customer",
+  store: "New store",
+  area: "New area",
+  phone: "081-234-5678",
+  address: "New address",
+});
+assert.equal(created.customer.customerId, MANUAL_ID);
+assert.equal(created.customer.lineUserId, "");
+assert.equal(createdCustomer.type, "MANUAL");
+assert.equal(createdCustomer.loyaltyNote, "EXCLUDED_UNTIL_LINE_LINKED");
+assert.throws(
+  () =>
+    context.handleAdminCustomerCreate_({
+      idToken: "admin-token",
+      lineUserId: ADMIN_ID,
+      customerDisplayName: "",
+      store: "Store",
+      area: "Area",
+      phone: "0812345678",
+    }),
+  /Customer name is required/,
+);
 
 context.resolveIdentity_ = () => ({
   lineUserId: OTHER_ID,
@@ -172,5 +228,45 @@ assert.equal(writtenItems[0].unitPrice, 200);
 assert.equal(writtenItems[0].Cost, 240);
 assert.equal(writtenItems[0].Profit, 160);
 assert.equal(result.orderMode, "ADMIN");
+
+let manualUpdated = null;
+context.getManualCustomerProfile_ = () => ({
+  lineUserId: "",
+  customerId: MANUAL_ID,
+  displayName: "Walk-in customer",
+  store: "Manual store",
+  area: "Manual area",
+  phone: "0899999999",
+  defaultAddress: "Manual address",
+});
+context.updateManualCustomer_ = (customerId, profile) => {
+  manualUpdated = { customerId, profile };
+};
+vm.runInContext(
+  `createOrder_(
+    {
+      cart: [{ SKU: "SKU-1", qty: 1 }]
+    },
+    {
+      lineUserId: "",
+      customerId: "${MANUAL_ID}",
+      displayName: "Walk-in customer",
+      tokenVerified: true,
+      tokenError: "",
+      isGuest: false,
+      isManual: true
+    },
+    {
+      createdByLineUserId: "${ADMIN_ID}",
+      orderMode: "ADMIN",
+      adminNotificationLineUserId: "${ADMIN_ID}"
+    }
+  )`,
+  context,
+);
+assert.equal(writtenOrder.lineUserId, "");
+assert.equal(writtenOrder.customerId, MANUAL_ID);
+assert.equal(writtenOrder.loyaltyStatus, "EXCLUDED");
+assert.equal(manualUpdated.customerId, MANUAL_ID);
 
 console.log("admin flow tests passed");
