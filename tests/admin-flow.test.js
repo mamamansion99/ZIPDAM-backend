@@ -190,6 +190,16 @@ context.appendOrder_ = (order) => {
 context.appendOrderItems_ = (_orderId, items) => {
   writtenItems = items;
 };
+context.safeApplyLoyaltyAfterOrder_ = () => ({
+  eligible: true,
+  totalSpend: 12450,
+  targetSpend: 10000,
+  cycleSpend: 2450,
+  remainingSpend: 7550,
+  progressPercent: 25,
+  rewardEarned: false,
+  nextCycle: 2,
+});
 context.safePushOrderConfirmation_ = () => ({
   attempted: false,
   ok: false,
@@ -228,6 +238,7 @@ assert.equal(writtenItems[0].unitPrice, 200);
 assert.equal(writtenItems[0].Cost, 240);
 assert.equal(writtenItems[0].Profit, 160);
 assert.equal(result.orderMode, "ADMIN");
+assert.equal(result.loyalty.totalSpend, 12450);
 
 let manualUpdated = null;
 context.getManualCustomerProfile_ = () => ({

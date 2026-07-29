@@ -28,6 +28,7 @@ const ZIPDAM_SCHEMA = Object.freeze({
   OrderItems: ['OrderID', 'SKU', 'Brand', 'Size', 'Name', 'qty', 'unitPrice', 'lineTotal', 'Profit', 'Cost'],
   Favorites: ['lineUserId', 'SKU', 'Brand', 'Size', 'Name', 'createdAt', 'updatedAt'],
   Templates: ['templateId', 'lineUserId', 'templateName', 'itemsJson', 'createdAt', 'updatedAt', 'lastUsedAt', 'note'],
+  LoyaltyLedger: ['LedgerID', 'CreatedAt', 'customerId', 'OrderID', 'Type', 'PurchaseAmount', 'Points', 'CreatedByLineUserId', 'Note', 'Status'],
   Rewards: ['RewardID', 'RewardName', 'RequiredSpend', 'RequiredPoints', 'RewardType', 'RewardValue', 'Active', 'StartDate', 'EndDate', 'Note']
 });
 
@@ -641,6 +642,14 @@ function createOrder_(body, identity, options) {
 
   appendOrderItems_(orderId, items);
 
+  const loyalty = identity.isGuest || identity.isManual
+    ? { eligible: false, reason: 'Customer is not linked to LINE' }
+    : safeApplyLoyaltyAfterOrder_(
+        identity.lineUserId,
+        orderId,
+        settings.createdByLineUserId
+      );
+
   const config = getConfig_();
   const linePush = safePushOrderConfirmation_(
     config.LINE_MESSAGING_TOKEN,
@@ -652,7 +661,8 @@ function createOrder_(body, identity, options) {
     grandTotal,
     identity.displayName,
     address,
-    phone
+    phone,
+    loyalty
   );
 
   const adminNotificationLineUserId = text_(settings.adminNotificationLineUserId);
@@ -669,7 +679,8 @@ function createOrder_(body, identity, options) {
         grandTotal,
         identity.displayName,
         address,
-        phone
+        phone,
+        loyalty
       )
     : { attempted: false, ok: false };
 
@@ -689,6 +700,7 @@ function createOrder_(body, identity, options) {
     orderMode,
     createdByLineUserId: settings.createdByLineUserId,
     cart: items,
+    loyalty,
     tokenVerified: identity.tokenVerified,
     tokenError: identity.tokenError
   });
@@ -710,6 +722,7 @@ function createOrder_(body, identity, options) {
     createdByLineUserId: settings.createdByLineUserId,
     tokenVerified: identity.tokenVerified,
     tokenError: identity.tokenError,
+    loyalty,
     linePush,
     adminPush,
     n8nPush
@@ -1198,7 +1211,7 @@ function calculateCustomerSummary_(lineUserId) {
     productTotal,
     shippingTotal,
     lifetimeSpend,
-    rewards: getEligibleRewards_(lifetimeSpend)
+    rewards: getEligibleRewards_(productTotal)
   };
 }
 
@@ -1235,6 +1248,210 @@ function getEligibleRewards_(lifetimeSpend) {
       };
     })
     .filter(Boolean);
+}
+
+function safeApplyLoyaltyAfterOrder_(lineUserId, orderId, createdByLineUserId) {
+  if (!isRealLineUserId_(lineUserId)) {
+    return { eligible: false, reason: 'Customer is not linked to LINE' };
+  }
+
+  try {
+    const reward = getActiveSpendReward_();
+    if (!reward) return { eligible: false, reason: 'No active spend reward' };
+
+    const totalSpend = calculateEligibleProductSpend_(lineUserId);
+    const achievedCycles = Math.floor(totalSpend / reward.requiredSpend);
+    const earnedCycles = ensureLoyaltyRewardCycles_(
+      lineUserId,
+      orderId,
+      createdByLineUserId,
+      reward,
+      achievedCycles,
+      totalSpend
+    );
+    if (earnedCycles.length) {
+      updateOrderRewardApplied_(
+        orderId,
+        earnedCycles
+          .map(cycle => `${reward.rewardId}#${cycle}`)
+          .join(',')
+      );
+    }
+
+    const latestEarnedCycle = earnedCycles.length
+      ? earnedCycles[earnedCycles.length - 1]
+      : 0;
+    const cycleSpend = latestEarnedCycle
+      ? reward.requiredSpend
+      : totalSpend % reward.requiredSpend;
+    const remainingSpend = latestEarnedCycle
+      ? 0
+      : Math.max(0, reward.requiredSpend - cycleSpend);
+
+    return {
+      eligible: true,
+      rewardId: reward.rewardId,
+      rewardName: reward.rewardName,
+      rewardValue: reward.rewardValue,
+      totalSpend,
+      targetSpend: reward.requiredSpend,
+      cycleSpend,
+      remainingSpend,
+      progressPercent: Math.min(
+        100,
+        Math.round((cycleSpend / reward.requiredSpend) * 100)
+      ),
+      rewardEarned: earnedCycles.length > 0,
+      earnedCycles,
+      nextCycle: latestEarnedCycle || achievedCycles + 1
+    };
+  } catch (err) {
+    return {
+      eligible: false,
+      error: errorMessage_(err)
+    };
+  }
+}
+
+function getActiveSpendReward_() {
+  const { sheet, map } = assertHeaders_('Rewards', [
+    'RewardID',
+    'RewardName',
+    'RequiredSpend',
+    'RewardType',
+    'RewardValue',
+    'Active',
+    'StartDate',
+    'EndDate'
+  ]);
+  if (sheet.getLastRow() < 2) return null;
+
+  const rows = sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+    .getValues();
+  const now = new Date();
+  const rewards = rows.map(row => {
+    const value = header => map[header] ? row[map[header] - 1] : '';
+    const active = value('Active');
+    const startDate = value('StartDate');
+    const endDate = value('EndDate');
+    const requiredSpend = toNumber_(value('RequiredSpend'));
+
+    if (!(active === true || text_(active).toLowerCase() === 'true')) return null;
+    if (!text_(value('RewardID')) || requiredSpend <= 0) return null;
+    if (startDate && new Date(startDate) > now) return null;
+    if (endDate && new Date(endDate) < now) return null;
+
+    return {
+      rewardId: text_(value('RewardID')),
+      rewardName: text_(value('RewardName')) || 'ของแถมยอดสะสม',
+      requiredSpend,
+      rewardType: text_(value('RewardType')) || 'GIFT',
+      rewardValue: text_(value('RewardValue')) || 'ของแถม 1 รายการ'
+    };
+  }).filter(Boolean);
+
+  rewards.sort((left, right) => left.requiredSpend - right.requiredSpend);
+  return rewards[0] || null;
+}
+
+function calculateEligibleProductSpend_(lineUserId) {
+  const { sheet, map } = assertHeaders_('Orders', [
+    'lineUserId',
+    'itemsTotal',
+    'status'
+  ]);
+  if (sheet.getLastRow() < 2) return 0;
+
+  const rows = sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+    .getValues();
+  return Math.round(rows.reduce((total, row) => {
+    if (text_(row[map.lineUserId - 1]) !== lineUserId) return total;
+    const status = text_(row[map.status - 1]).toUpperCase();
+    if (['CANCELLED', 'CANCELED', 'VOID'].includes(status)) return total;
+    return total + toNumber_(row[map.itemsTotal - 1]);
+  }, 0));
+}
+
+function ensureLoyaltyRewardCycles_(
+  lineUserId,
+  orderId,
+  createdByLineUserId,
+  reward,
+  achievedCycles,
+  totalSpend
+) {
+  if (achievedCycles <= 0) return [];
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const existingCycles = getExistingRewardCycles_(lineUserId, reward.rewardId);
+    const earnedCycles = [];
+
+    for (let cycle = 1; cycle <= achievedCycles; cycle += 1) {
+      if (existingCycles.has(cycle)) continue;
+      appendObjectRow_('LoyaltyLedger', {
+        LedgerID: 'LG-' + Utilities.getUuid(),
+        CreatedAt: nowIso_(),
+        customerId: lineUserId,
+        OrderID: orderId,
+        Type: 'EARN',
+        PurchaseAmount: Math.min(totalSpend, reward.requiredSpend * cycle),
+        Points: '',
+        CreatedByLineUserId: createdByLineUserId,
+        Note: rewardCycleNote_(reward.rewardId, cycle),
+        Status: 'ACTIVE'
+      }, ZIPDAM_SCHEMA.LoyaltyLedger);
+      earnedCycles.push(cycle);
+    }
+
+    return earnedCycles;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getExistingRewardCycles_(lineUserId, rewardId) {
+  const { sheet, map } = assertHeaders_('LoyaltyLedger', [
+    'customerId',
+    'Type',
+    'Note',
+    'Status'
+  ]);
+  if (sheet.getLastRow() < 2) return new Set();
+
+  const rows = sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+    .getValues();
+  const prefix = rewardCycleNote_(rewardId, '');
+  const cycles = new Set();
+
+  rows.forEach(row => {
+    if (text_(row[map.customerId - 1]) !== lineUserId) return;
+    if (text_(row[map.Type - 1]).toUpperCase() !== 'EARN') return;
+    if (text_(row[map.Status - 1]).toUpperCase() !== 'ACTIVE') return;
+
+    const note = text_(row[map.Note - 1]);
+    if (!note.startsWith(prefix)) return;
+    const cycle = Math.floor(toNumber_(note.slice(prefix.length)));
+    if (cycle > 0) cycles.add(cycle);
+  });
+
+  return cycles;
+}
+
+function rewardCycleNote_(rewardId, cycle) {
+  return `REWARD:${text_(rewardId)}:CYCLE:${cycle}`;
+}
+
+function updateOrderRewardApplied_(orderId, rewardApplied) {
+  const { sheet, map } = assertHeaders_('Orders', ['OrderID', 'rewardApplied']);
+  const rowNumber = findRowByValue_(sheet, map.OrderID, orderId);
+  if (!rowNumber) return false;
+  updateObjectRow_(sheet, rowNumber, map, { rewardApplied });
+  return true;
 }
 
 /* =========================
@@ -1494,33 +1711,24 @@ function safePushOrderConfirmation_(
   grandTotal,
   displayName,
   address,
-  phone
+  phone,
+  loyalty
 ) {
   if (!token) return { attempted: false, ok: false, error: 'LINE_MESSAGING_TOKEN is not configured' };
   if (!isRealLineUserId_(lineUserId)) return { attempted: false, ok: false, error: 'Invalid LINE user ID' };
 
   try {
-    const itemText = items.map((item, index) => [
-      `${index + 1}) ${item.Name}${item.Size ? ' ' + item.Size : ''}${item.pack ? ` (${item.pack}ชิ้น)` : ''}`,
-      `   จำนวน ${item.qty} กล่อง`,
-      `   ราคากล่องละ ${formatTHB_(item.unitPrice)}`,
-      `   รวม ${formatTHB_(item.lineTotal)}`
-    ].join('\n')).join('\n\n');
-
-    const message = [
-      '🧾 ยืนยันคำสั่งซื้อ ZIPDAM',
-      `Order: ${orderId}`,
-      `ลูกค้า: ${displayName || '-'}`,
-      `ที่อยู่: ${address || '-'}`,
-      `โทร: ${phone || '-'}`,
-      '────────────',
-      itemText,
-      '────────────',
-      `ค่าสินค้า: ${formatTHB_(itemsTotal)}`,
-      `ค่าส่ง: ${formatTHB_(shippingFee)}`,
-      `ยอดรวมสุทธิ: ${formatTHB_(grandTotal)}`,
-      '🙏 ขอบคุณที่สั่งซื้อกับเรา'
-    ].join('\n');
+    const message = buildOrderConfirmationFlex_({
+      orderId,
+      items,
+      itemsTotal,
+      shippingFee,
+      grandTotal,
+      displayName,
+      address,
+      phone,
+      loyalty
+    });
 
     const response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
       method: 'post',
@@ -1528,7 +1736,7 @@ function safePushOrderConfirmation_(
       headers: { Authorization: 'Bearer ' + token },
       payload: JSON.stringify({
         to: lineUserId,
-        messages: [{ type: 'text', text: message }]
+        messages: [message]
       }),
       muteHttpExceptions: true
     });
@@ -1543,6 +1751,348 @@ function safePushOrderConfirmation_(
   } catch (err) {
     return { attempted: true, ok: false, error: errorMessage_(err) };
   }
+}
+
+function buildOrderConfirmationFlex_(order) {
+  const colors = {
+    green: '#138A55',
+    paleGreen: '#EAF7F0',
+    deepGreen: '#0B6B40',
+    text: '#111827',
+    muted: '#6B7280',
+    border: '#E5E7EB',
+    track: '#E7EEE9',
+    white: '#FFFFFF'
+  };
+  const visibleItems = order.items.slice(0, 7);
+  const itemContents = visibleItems.map(item => ({
+    type: 'box',
+    layout: 'horizontal',
+    margin: 'md',
+    alignItems: 'center',
+    contents: [
+      {
+        type: 'box',
+        layout: 'vertical',
+        flex: 4,
+        contents: [
+          {
+            type: 'text',
+            text: text_(item.Name) || 'สินค้า',
+            size: 'sm',
+            color: colors.text,
+            wrap: true
+          },
+          {
+            type: 'text',
+            text: [
+              text_(item.Size),
+              `${toNumber_(item.qty)} กล่อง`
+            ].filter(Boolean).join('  •  '),
+            size: 'xs',
+            color: colors.muted,
+            margin: 'xs'
+          }
+        ]
+      },
+      {
+        type: 'text',
+        text: formatTHB_(item.lineTotal),
+        size: 'sm',
+        weight: 'bold',
+        color: colors.text,
+        align: 'end',
+        flex: 2
+      }
+    ]
+  }));
+
+  if (order.items.length > visibleItems.length) {
+    itemContents.push({
+      type: 'text',
+      text: `และอีก ${order.items.length - visibleItems.length} รายการ`,
+      size: 'xs',
+      color: colors.muted,
+      margin: 'md',
+      align: 'center'
+    });
+  }
+
+  const bodyContents = [
+    {
+      type: 'box',
+      layout: 'horizontal',
+      contents: [
+        {
+          type: 'text',
+          text: 'คำสั่งซื้อสำเร็จ',
+          size: 'xl',
+          weight: 'bold',
+          color: colors.text,
+          flex: 3
+        },
+        {
+          type: 'text',
+          text: text_(order.orderId),
+          size: 'xs',
+          color: colors.green,
+          weight: 'bold',
+          align: 'end',
+          gravity: 'center',
+          flex: 2
+        }
+      ]
+    },
+    {
+      type: 'text',
+      text: text_(order.displayName) || 'ลูกค้า ZIPDAM',
+      size: 'sm',
+      color: colors.muted,
+      margin: 'sm',
+      wrap: true
+    },
+    {
+      type: 'separator',
+      margin: 'xl',
+      color: colors.border
+    },
+    {
+      type: 'text',
+      text: 'รายการสินค้า',
+      size: 'xs',
+      weight: 'bold',
+      color: colors.green,
+      margin: 'xl'
+    }
+  ].concat(itemContents, [
+    {
+      type: 'separator',
+      margin: 'xl',
+      color: colors.border
+    },
+    summaryFlexRow_('ยอดสินค้า', order.itemsTotal, colors, 'md', false),
+    summaryFlexRow_('ค่าจัดส่ง', order.shippingFee, colors, 'sm', false),
+    summaryFlexRow_('ยอดสุทธิ', order.grandTotal, colors, 'md', true)
+  ]);
+
+  if (text_(order.address) || text_(order.phone)) {
+    bodyContents.push(
+      {
+        type: 'separator',
+        margin: 'xl',
+        color: colors.border
+      },
+      {
+        type: 'text',
+        text: 'ข้อมูลจัดส่ง',
+        size: 'xs',
+        weight: 'bold',
+        color: colors.green,
+        margin: 'xl'
+      }
+    );
+    if (text_(order.address)) {
+      bodyContents.push({
+        type: 'text',
+        text: text_(order.address).slice(0, 180),
+        size: 'xs',
+        color: colors.muted,
+        margin: 'sm',
+        wrap: true
+      });
+    }
+    if (text_(order.phone)) {
+      bodyContents.push({
+        type: 'text',
+        text: `โทร ${text_(order.phone)}`,
+        size: 'xs',
+        color: colors.muted,
+        margin: 'xs'
+      });
+    }
+  }
+
+  if (order.loyalty?.eligible) {
+    bodyContents.push(...buildLoyaltyFlexContents_(order.loyalty, colors));
+  }
+
+  bodyContents.push({
+    type: 'text',
+    text: 'ขอบคุณที่ไว้วางใจ ZIPDAM',
+    size: 'xs',
+    color: colors.muted,
+    align: 'center',
+    margin: 'xl'
+  });
+
+  return {
+    type: 'flex',
+    altText: `ZIPDAM ${text_(order.orderId)} ยอดสุทธิ ${formatTHB_(order.grandTotal)}`,
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      styles: {
+        header: {
+          backgroundColor: colors.paleGreen
+        },
+        body: {
+          backgroundColor: colors.white
+        }
+      },
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'lg',
+        contents: [
+          {
+            type: 'text',
+            text: 'ZIPDAM',
+            size: 'sm',
+            weight: 'bold',
+            color: colors.deepGreen,
+            align: 'center'
+          }
+        ]
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        paddingAll: 'xl',
+        contents: bodyContents
+      }
+    }
+  };
+}
+
+function summaryFlexRow_(label, amount, colors, margin, emphasize) {
+  return {
+    type: 'box',
+    layout: 'horizontal',
+    margin,
+    contents: [
+      {
+        type: 'text',
+        text: label,
+        size: emphasize ? 'md' : 'sm',
+        weight: emphasize ? 'bold' : 'regular',
+        color: emphasize ? colors.text : colors.muted,
+        flex: 3
+      },
+      {
+        type: 'text',
+        text: formatTHB_(amount),
+        size: emphasize ? 'lg' : 'sm',
+        weight: 'bold',
+        color: emphasize ? colors.green : colors.text,
+        align: 'end',
+        flex: 2
+      }
+    ]
+  };
+}
+
+function buildLoyaltyFlexContents_(loyalty, colors) {
+  const progressPercent = Math.max(
+    1,
+    Math.min(100, Math.round(toNumber_(loyalty.progressPercent)))
+  );
+  const rewardText = loyalty.rewardEarned
+    ? `ครบยอดแล้ว รับ ${text_(loyalty.rewardValue) || 'ของแถม 1 รายการ'}`
+    : `อีก ${formatTHB_(loyalty.remainingSpend)} รับ ${text_(loyalty.rewardValue) || 'ของแถม 1 รายการ'}`;
+
+  return [
+    {
+      type: 'separator',
+      margin: 'xl',
+      color: colors.border
+    },
+    {
+      type: 'text',
+      text: 'ยอดสั่งซื้อสะสม',
+      size: 'sm',
+      weight: 'bold',
+      color: colors.green,
+      margin: 'xl'
+    },
+    {
+      type: 'text',
+      text: formatTHB_(loyalty.totalSpend),
+      size: 'xxl',
+      weight: 'bold',
+      color: colors.text,
+      margin: 'sm'
+    },
+    {
+      type: 'box',
+      layout: 'horizontal',
+      margin: 'sm',
+      contents: [
+        {
+          type: 'text',
+          text: `รอบที่ ${toNumber_(loyalty.nextCycle)}  •  ${formatTHB_(loyalty.cycleSpend)} / ${formatTHB_(loyalty.targetSpend)}`,
+          size: 'xs',
+          color: colors.muted,
+          flex: 4
+        },
+        {
+          type: 'text',
+          text: `${toNumber_(loyalty.progressPercent)}%`,
+          size: 'xs',
+          color: colors.green,
+          weight: 'bold',
+          align: 'end',
+          flex: 1
+        }
+      ]
+    },
+    {
+      type: 'box',
+      layout: 'horizontal',
+      height: '8px',
+      margin: 'md',
+      backgroundColor: colors.track,
+      cornerRadius: '4px',
+      contents: [
+        {
+          type: 'box',
+          layout: 'vertical',
+          width: `${progressPercent}%`,
+          height: '8px',
+          backgroundColor: colors.green,
+          cornerRadius: '4px',
+          contents: [{ type: 'filler' }]
+        }
+      ]
+    },
+    {
+      type: 'box',
+      layout: 'vertical',
+      margin: 'lg',
+      paddingAll: 'md',
+      backgroundColor: colors.paleGreen,
+      cornerRadius: 'lg',
+      contents: [
+        {
+          type: 'text',
+          text: rewardText,
+          size: 'sm',
+          weight: 'bold',
+          color: colors.deepGreen,
+          align: 'center',
+          wrap: true
+        }
+      ]
+    },
+    {
+      type: 'text',
+      text: 'ยอดสะสมนับเฉพาะค่าสินค้า ไม่รวมค่าจัดส่ง',
+      size: 'xxs',
+      color: colors.muted,
+      align: 'center',
+      margin: 'sm',
+      wrap: true
+    }
+  ];
 }
 
 function sendN8NWebhook_(url, payload) {
