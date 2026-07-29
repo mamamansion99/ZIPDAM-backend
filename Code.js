@@ -15,6 +15,9 @@
  *   POST {action:"favorites_get|favorites_add|favorites_remove", ...}
  *   POST {action:"templates_get|templates_add|templates_delete", ...}
  *   POST {action:"frequent_get", idToken, lineUserId?, limit}
+ *   POST {action:"admin_status", idToken, lineUserId}
+ *   POST {action:"admin_customers_search", idToken, lineUserId, query}
+ *   POST {action:"admin_order", idToken, lineUserId, selectedCustomerId, cart:[...]}
  */
 
 const ZIPDAM_SCHEMA = Object.freeze({
@@ -29,13 +32,18 @@ const ZIPDAM_SCHEMA = Object.freeze({
 
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
+  const adminLineUserIds = parseLineUserIds_([
+    props.getProperty('ADMIN_LINE_USER_IDS'),
+    props.getProperty('ADMIN_LINE_USER_ID')
+  ].filter(Boolean).join(','));
 
   return {
     SHEET_ID: props.getProperty('SHEET_ID') || '11sUClcToFNjQXafrZUgRaLGZW3NO2-cAfSIxe2IgsoE',
     LINE_LOGIN_CHANNEL_ID: props.getProperty('LINE_LOGIN_CHANNEL_ID') || '2008727011',
     LINE_MESSAGING_TOKEN: props.getProperty('LINE_MESSAGING_TOKEN') || '',
     N8N_WEBHOOK_URL: props.getProperty('N8N_WEBHOOK_URL') || '',
-    ADMIN_LINE_USER_ID: props.getProperty('ADMIN_LINE_USER_ID') || '',
+    ADMIN_LINE_USER_ID: adminLineUserIds[0] || '',
+    ADMIN_LINE_USER_IDS: adminLineUserIds,
     FIXED_SHIPPING: numberProperty_(props, 'FIXED_SHIPPING', 20),
     LOW_ORDER_SHIPPING: numberProperty_(props, 'LOW_ORDER_SHIPPING', 30),
     SHIPPING_THRESHOLD: numberProperty_(props, 'SHIPPING_THRESHOLD', 200),
@@ -55,6 +63,17 @@ function boolProperty_(props, key, fallback) {
   const raw = props.getProperty(key);
   if (raw === null || raw === '') return fallback;
   return String(raw).toLowerCase() === 'true';
+}
+
+function configureAdminLineUserIds(lineUserIds) {
+  const ids = parseLineUserIds_(
+    Array.isArray(lineUserIds) ? lineUserIds.join(',') : lineUserIds
+  );
+  assert_(ids.length > 0, 'At least one valid LINE user ID is required');
+  PropertiesService
+    .getScriptProperties()
+    .setProperty('ADMIN_LINE_USER_IDS', ids.join(','));
+  return { ok: true, count: ids.length };
 }
 
 function json_(obj) {
@@ -92,6 +111,9 @@ function doPost(e) {
       case 'templates_add': return json_(handleTemplatesAdd_(body));
       case 'templates_delete': return json_(handleTemplatesDelete_(body));
       case 'frequent_get': return json_(handleFrequentGet_(body));
+      case 'admin_status': return json_(handleAdminStatus_(body));
+      case 'admin_customers_search': return json_(handleAdminCustomersSearch_(body));
+      case 'admin_order': return json_(handleAdminOrder_(body));
       default: return json_({ ok: false, error: 'Unknown POST action.' });
     }
   } catch (err) {
@@ -131,6 +153,15 @@ function nowIso_() {
 
 function isRealLineUserId_(value) {
   return /^U[0-9a-f]{32}$/i.test(text_(value));
+}
+
+function parseLineUserIds_(value) {
+  return Array.from(new Set(
+    text_(value)
+      .split(/[\s,;]+/)
+      .map(id => text_(id))
+      .filter(isRealLineUserId_)
+  ));
 }
 
 function formatTHB_(value) {
@@ -232,6 +263,35 @@ function resolveIdentity_(body, options) {
     tokenError: '',
     isGuest: true
   };
+}
+
+function isAdminLineUserId_(lineUserId) {
+  return getConfig_().ADMIN_LINE_USER_IDS.includes(text_(lineUserId));
+}
+
+function resolveVerifiedActor_(body) {
+  const verified = verifyLineIdToken_(body.idToken);
+  const lineUserId = text_(verified?.sub);
+  const providedLineUserId = text_(body.lineUserId);
+  assert_(isRealLineUserId_(lineUserId), 'Invalid verified LINE user ID');
+  if (providedLineUserId) {
+    assert_(isRealLineUserId_(providedLineUserId), 'Invalid LINE user ID');
+    assert_(providedLineUserId === lineUserId, 'LINE identity mismatch');
+  }
+  return {
+    lineUserId,
+    customerId: lineUserId,
+    displayName: text_(verified?.name) || text_(body.displayName) || 'LINE customer',
+    tokenVerified: true,
+    tokenError: '',
+    isGuest: false
+  };
+}
+
+function requireAdmin_(body) {
+  const identity = resolveVerifiedActor_(body);
+  assert_(isAdminLineUserId_(identity.lineUserId), 'Admin access required');
+  return identity;
 }
 
 /* =========================
@@ -472,10 +532,23 @@ function getShippingFee_(itemsTotal) {
  * ========================= */
 
 function handleOrder_(body) {
+  const identity = resolveIdentity_(body, { allowGuest: true });
+  return createOrder_(body, identity, {
+    createdByLineUserId: identity.lineUserId,
+    orderMode: 'SELF',
+    adminNotificationLineUserId: getConfig_().ADMIN_LINE_USER_ID
+  });
+}
+
+function createOrder_(body, identity, options) {
+  const settings = Object.assign({
+    createdByLineUserId: identity.lineUserId,
+    orderMode: 'SELF',
+    adminNotificationLineUserId: ''
+  }, options || {});
   const cart = Array.isArray(body.cart) ? body.cart : [];
   assert_(cart.length > 0, 'Cart is empty');
 
-  const identity = resolveIdentity_(body, { allowGuest: true });
   const profile = identity.isGuest ? emptyProfile_() : getCustomerProfile_(identity.lineUserId);
 
   const store = text_(body.store || body.storeName) || profile.store;
@@ -525,9 +598,7 @@ function handleOrder_(body) {
   const grandTotal = itemsTotal + shippingFee;
   const orderId = getNextOrderId_();
   const createdAt = nowIso_();
-  const orderMode = ['SELF', 'ADMIN', 'LEGACY'].includes(text_(body.orderMode).toUpperCase())
-    ? text_(body.orderMode).toUpperCase()
-    : 'SELF';
+  const orderMode = settings.orderMode === 'ADMIN' ? 'ADMIN' : 'SELF';
 
   appendOrder_({
     OrderID: orderId,
@@ -543,7 +614,7 @@ function handleOrder_(body) {
     address,
     phone,
     note: text_(body.note),
-    createdByLineUserId: identity.lineUserId,
+    createdByLineUserId: settings.createdByLineUserId,
     orderMode,
     loyaltyStatus: identity.isGuest ? 'EXCLUDED' : 'PENDING',
     pointsEarned: '',
@@ -566,10 +637,13 @@ function handleOrder_(body) {
     phone
   );
 
-  const adminPush = config.ADMIN_LINE_USER_ID && config.ADMIN_LINE_USER_ID !== identity.lineUserId
+  const adminNotificationLineUserId = text_(settings.adminNotificationLineUserId);
+  const adminPush =
+    isRealLineUserId_(adminNotificationLineUserId) &&
+    adminNotificationLineUserId !== identity.lineUserId
     ? safePushOrderConfirmation_(
         config.LINE_MESSAGING_TOKEN,
-        config.ADMIN_LINE_USER_ID,
+        adminNotificationLineUserId,
         orderId,
         items,
         itemsTotal,
@@ -595,6 +669,7 @@ function handleOrder_(body) {
     shippingFee,
     grandTotal,
     orderMode,
+    createdByLineUserId: settings.createdByLineUserId,
     cart: items,
     tokenVerified: identity.tokenVerified,
     tokenError: identity.tokenError
@@ -613,12 +688,100 @@ function handleOrder_(body) {
     itemsTotal,
     shippingFee,
     grandTotal,
+    orderMode,
+    createdByLineUserId: settings.createdByLineUserId,
     tokenVerified: identity.tokenVerified,
     tokenError: identity.tokenError,
     linePush,
     adminPush,
     n8nPush
   };
+}
+
+/* =========================
+ * ADMIN CUSTOMER ORDERS
+ * ========================= */
+
+function handleAdminStatus_(body) {
+  const identity = resolveVerifiedActor_(body);
+  return {
+    ok: true,
+    isAdmin: isAdminLineUserId_(identity.lineUserId)
+  };
+}
+
+function handleAdminCustomersSearch_(body) {
+  requireAdmin_(body);
+  const query = text_(body.query).toLowerCase().slice(0, 100);
+  const limit = Math.max(1, Math.min(30, Math.floor(toNumber_(body.limit) || 20)));
+  const { sheet, map } = assertHeaders_('Customer', ['lineUserId', 'customerId']);
+  if (sheet.getLastRow() < 2) return { ok: true, customers: [] };
+
+  const rows = sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn())
+    .getValues();
+  const customers = [];
+
+  for (let index = rows.length - 1; index >= 0 && customers.length < limit; index -= 1) {
+    const row = rows[index];
+    const value = header => map[header] ? row[map[header] - 1] : '';
+    const lineUserId = text_(value('lineUserId'));
+    if (!isRealLineUserId_(lineUserId)) continue;
+
+    const customer = {
+      lineUserId,
+      customerId: lineUserId,
+      displayName: text_(value('displayName') || value('name')) || 'LINE customer',
+      store: text_(value('store')),
+      area: text_(value('area')),
+      phone: normalisePhone_(value('phone')),
+      defaultAddress: text_(value('defaultAddress')),
+      type: text_(value('type')) || 'LINE',
+      status: text_(value('status')) || 'ACTIVE'
+    };
+    const haystack = [
+      customer.lineUserId,
+      customer.displayName,
+      customer.store,
+      customer.area,
+      customer.phone
+    ].join(' ').toLowerCase();
+
+    if (!query || haystack.includes(query)) customers.push(customer);
+  }
+
+  return { ok: true, customers };
+}
+
+function handleAdminOrder_(body) {
+  const adminIdentity = requireAdmin_(body);
+  const selectedCustomerId = text_(body.selectedCustomerId);
+  assert_(isRealLineUserId_(selectedCustomerId), 'Select a valid LINE customer');
+
+  const customerProfile = getCustomerProfile_(selectedCustomerId);
+  assert_(customerProfile.lineUserId === selectedCustomerId, 'Customer not found');
+
+  const customerIdentity = {
+    lineUserId: selectedCustomerId,
+    customerId: selectedCustomerId,
+    displayName: customerProfile.displayName || 'LINE customer',
+    tokenVerified: true,
+    tokenError: '',
+    isGuest: false
+  };
+
+  return createOrder_(Object.assign({}, body, {
+    lineUserId: selectedCustomerId,
+    displayName: customerIdentity.displayName,
+    store: text_(body.store) || customerProfile.store,
+    area: text_(body.area || body.soi) || customerProfile.area,
+    phone: normalisePhone_(body.phone) || customerProfile.phone,
+    address: text_(body.address || body.defaultAddress) || customerProfile.defaultAddress
+  }), customerIdentity, {
+    createdByLineUserId: adminIdentity.lineUserId,
+    orderMode: 'ADMIN',
+    adminNotificationLineUserId: adminIdentity.lineUserId
+  });
 }
 
 function appendOrder_(order) {
