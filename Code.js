@@ -9,21 +9,21 @@
  *   GET  ?action=catalog
  *   GET  ?action=health
  *   POST {action:"order", idToken, lineUserId, displayName, store, area, address, phone, cart:[...]}
- *   POST {action:"me", idToken?, lineUserId?}
+ *   POST {action:"me", idToken, lineUserId?}
  *   POST {action:"customer_profile|customer_profile_set", ...}
- *   POST {action:"customer_summary", idToken?, lineUserId?}
+ *   POST {action:"customer_summary", idToken, lineUserId?}
  *   POST {action:"favorites_get|favorites_add|favorites_remove", ...}
  *   POST {action:"templates_get|templates_add|templates_delete", ...}
- *   POST {action:"frequent_get", idToken?, lineUserId?, limit}
+ *   POST {action:"frequent_get", idToken, lineUserId?, limit}
  */
 
 const ZIPDAM_SCHEMA = Object.freeze({
-  Product: ['SKU', 'Brand', 'Feature', 'Size', 'Name', 'mm', 'pack', 'price', 'promo_price', 'image_key', 'active', 'Cost'],
-  Customer: ['lineUserId', 'customerId', 'name', 'displayName', 'store', 'area', 'phone', 'defaultAddress', 'createdAt', 'lastSeenAt'],
-  Orders: ['OrderID', 'CreatedAt', 'lineUserId', 'displayName', 'customerId', 'store', 'itemsTotal', 'shippingFee', 'grandTotal', 'status', 'address', 'phone'],
-  OrderItems: ['OrderID', 'SKU', 'Brand', 'Size', 'Name', 'qty', 'unitPrice', 'lineTotal'],
+  Product: ['SKU', 'Brand', 'Size', 'Name', 'mm', 'pack', 'price', 'promo_price', 'image_key', 'active', 'Cost'],
+  Customer: ['lineUserId', 'customerId', 'name', 'displayName', 'type', 'store', 'storeId', 'area', 'phone', 'defaultAddress', 'createdAt', 'lastSeenAt', 'note', 'status', 'linkedAt', 'loyaltyNote'],
+  Orders: ['OrderID', 'CreatedAt', 'lineUserId', 'displayName', 'customerId', 'store', 'itemsTotal', 'shippingFee', 'grandTotal', 'status', 'address', 'phone', 'note', 'createdByLineUserId', 'orderMode', 'loyaltyStatus', 'pointsEarned', 'rewardApplied'],
+  OrderItems: ['OrderID', 'SKU', 'Brand', 'Size', 'Name', 'qty', 'unitPrice', 'lineTotal', 'Profit', 'Cost'],
   Favorites: ['lineUserId', 'SKU', 'Brand', 'Size', 'Name', 'createdAt', 'updatedAt'],
-  Templates: ['templateId', 'lineUserId', 'templateName', 'itemsJson', 'createdAt', 'updatedAt', 'lastUsedAt'],
+  Templates: ['templateId', 'lineUserId', 'templateName', 'itemsJson', 'createdAt', 'updatedAt', 'lastUsedAt', 'note'],
   Rewards: ['RewardID', 'RewardName', 'RequiredSpend', 'RequiredPoints', 'RewardType', 'RewardValue', 'Active', 'StartDate', 'EndDate', 'Note']
 });
 
@@ -35,11 +35,11 @@ function getConfig_() {
     LINE_LOGIN_CHANNEL_ID: props.getProperty('LINE_LOGIN_CHANNEL_ID') || '2008727011',
     LINE_MESSAGING_TOKEN: props.getProperty('LINE_MESSAGING_TOKEN') || '',
     N8N_WEBHOOK_URL: props.getProperty('N8N_WEBHOOK_URL') || '',
-    ADMIN_LINE_USER_ID: props.getProperty('ADMIN_LINE_USER_ID') || 'U1d0318233f66c6ddc1fd998e49c5dcef',
+    ADMIN_LINE_USER_ID: props.getProperty('ADMIN_LINE_USER_ID') || '',
     FIXED_SHIPPING: numberProperty_(props, 'FIXED_SHIPPING', 20),
     LOW_ORDER_SHIPPING: numberProperty_(props, 'LOW_ORDER_SHIPPING', 30),
     SHIPPING_THRESHOLD: numberProperty_(props, 'SHIPPING_THRESHOLD', 200),
-    ALLOW_GUEST_ORDERS: boolProperty_(props, 'ALLOW_GUEST_ORDERS', true),
+    ALLOW_GUEST_ORDERS: boolProperty_(props, 'ALLOW_GUEST_ORDERS', false),
     ALLOW_LINE_ID_MISMATCH: boolProperty_(props, 'ALLOW_LINE_ID_MISMATCH', false)
   };
 }
@@ -178,18 +178,9 @@ function resolveIdentity_(body, options) {
   const providedLineUserId = text_(body.lineUserId);
   const providedDisplayName = text_(body.displayName);
 
-  let verified = null;
-  let tokenVerified = false;
-  let tokenError = '';
-
-  if (text_(body.idToken)) {
-    try {
-      verified = verifyLineIdToken_(body.idToken);
-      tokenVerified = true;
-    } catch (err) {
-      tokenError = errorMessage_(err);
-    }
-  }
+  const suppliedIdToken = text_(body.idToken);
+  const verified = suppliedIdToken ? verifyLineIdToken_(suppliedIdToken) : null;
+  const tokenVerified = Boolean(verified);
 
   const verifiedLineUserId = isRealLineUserId_(verified?.sub) ? text_(verified.sub) : '';
   const bodyLineUserId = isRealLineUserId_(providedLineUserId) ? providedLineUserId : '';
@@ -203,18 +194,29 @@ function resolveIdentity_(body, options) {
     throw new Error('LINE identity mismatch');
   }
 
-  const lineUserId = bodyLineUserId || verifiedLineUserId;
-  const displayName = providedDisplayName || text_(verified?.name) || 'Guest';
+  if (providedLineUserId && !bodyLineUserId) {
+    throw new Error('Invalid LINE user ID');
+  }
 
-  if (lineUserId) {
+  if (verifiedLineUserId) {
+    const resolvedLineUserId =
+      bodyLineUserId &&
+      bodyLineUserId !== verifiedLineUserId &&
+      config.ALLOW_LINE_ID_MISMATCH
+        ? bodyLineUserId
+        : verifiedLineUserId;
     return {
-      lineUserId,
-      customerId: lineUserId,
-      displayName,
+      lineUserId: resolvedLineUserId,
+      customerId: resolvedLineUserId,
+      displayName: text_(verified?.name) || providedDisplayName || 'LINE customer',
       tokenVerified,
-      tokenError,
+      tokenError: '',
       isGuest: false
     };
+  }
+
+  if (bodyLineUserId) {
+    throw new Error('LINE authentication required. Please reopen this page inside LINE and log in again');
   }
 
   if (settings.requireLine || !settings.allowGuest || !config.ALLOW_GUEST_ORDERS) {
@@ -225,9 +227,9 @@ function resolveIdentity_(body, options) {
   return {
     lineUserId: guestId,
     customerId: '',
-    displayName: displayName || 'Guest',
+    displayName: providedDisplayName || 'Guest',
     tokenVerified,
-    tokenError,
+    tokenError: '',
     isGuest: true
   };
 }
@@ -246,29 +248,41 @@ function getSheet_(name) {
   return sheet;
 }
 
-function getHeaderMap_(sheet) {
+function getHeaderInfo_(sheet) {
   const lastColumn = sheet.getLastColumn();
   assert_(lastColumn > 0, 'Sheet has no columns: ' + sheet.getName());
 
   const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
   const map = {};
+  const duplicates = [];
 
   headers.forEach((header, index) => {
     const key = text_(header);
     if (!key) return;
-    if (map[key]) throw new Error(`Duplicate header "${key}" in ${sheet.getName()}`);
+    if (map[key]) {
+      if (!duplicates.includes(key)) duplicates.push(key);
+      return;
+    }
     map[key] = index + 1;
   });
 
-  return map;
+  return { map, duplicates };
+}
+
+function getHeaderMap_(sheet) {
+  return getHeaderInfo_(sheet).map;
 }
 
 function assertHeaders_(sheetName, requiredHeaders) {
   const sheet = getSheet_(sheetName);
-  const map = getHeaderMap_(sheet);
+  const { map, duplicates } = getHeaderInfo_(sheet);
   const missing = requiredHeaders.filter(header => !map[header]);
   if (missing.length) {
     throw new Error(`${sheetName} missing columns: ${missing.join(', ')}`);
+  }
+  const duplicateRequired = duplicates.filter(header => requiredHeaders.includes(header));
+  if (duplicateRequired.length) {
+    throw new Error(`${sheetName} has duplicate required columns: ${duplicateRequired.join(', ')}`);
   }
   return { sheet, map };
 }
@@ -321,11 +335,16 @@ function getHealth_() {
   Object.keys(ZIPDAM_SCHEMA).forEach(sheetName => {
     try {
       const sheet = getSheet_(sheetName);
-      const map = getHeaderMap_(sheet);
+      const { map, duplicates } = getHeaderInfo_(sheet);
       const missing = ZIPDAM_SCHEMA[sheetName].filter(header => !map[header]);
+      const duplicateRequired = duplicates.filter(header => ZIPDAM_SCHEMA[sheetName].includes(header));
       checks[sheetName] = {
-        ok: missing.length === 0,
+        ok: missing.length === 0 && duplicateRequired.length === 0,
         missing,
+        duplicateRequired,
+        warnings: duplicates
+          .filter(header => !duplicateRequired.includes(header))
+          .map(header => `Duplicate non-required header: ${header}`),
         headers: Object.keys(map)
       };
     } catch (err) {
@@ -362,10 +381,7 @@ function getCatalog_() {
       return {
         SKU: text_(value('SKU')),
         Brand: text_(value('Brand')),
-        Feature: text_(value('Feature'))
-          .split('|')
-          .map(part => part.trim())
-          .filter(Boolean),
+        Feature: [],
         Size: text_(value('Size')),
         Name: text_(value('Name')),
         mm: value('mm'),
@@ -485,15 +501,16 @@ function handleOrder_(body) {
 
     const product = resolveProduct_(item, productIndex);
     const unitPrice = product.finalPrice;
+    assert_(unitPrice > 0, `Product price is unavailable: ${product.SKU || product.Name}`);
     const lineTotal = Math.round(unitPrice * quantity);
     const totalCost = Math.round(product.unitCost * quantity * 100) / 100;
     const profit = Math.round((lineTotal - totalCost) * 100) / 100;
 
     return {
       SKU: product.SKU,
-      Brand: text_(item.Brand || item.brand) || product.Brand,
-      Size: text_(item.Size || item.size) || product.Size,
-      Name: text_(item.Name || item.name) || product.Name,
+      Brand: product.Brand,
+      Size: product.Size,
+      Name: product.Name,
       pack: product.pack,
       qty: quantity,
       unitPrice,
@@ -670,19 +687,28 @@ function upsertCustomer_(profile) {
     customerId: profile.lineUserId,
     name: profile.displayName,
     displayName: profile.displayName,
-    store: profile.store,
-    area: profile.area,
-    phone: normalisePhone_(profile.phone),
-    defaultAddress: profile.defaultAddress,
     lastSeenAt: now,
     status: 'ACTIVE'
   };
 
   if (rowNumber) {
+    const contactUpdates = {
+      store: text_(profile.store),
+      area: text_(profile.area),
+      phone: normalisePhone_(profile.phone),
+      defaultAddress: text_(profile.defaultAddress)
+    };
+    Object.keys(contactUpdates).forEach(key => {
+      if (contactUpdates[key]) data[key] = contactUpdates[key];
+    });
     updateObjectRow_(sheet, rowNumber, map, data);
     return rowNumber;
   }
 
+  data.store = text_(profile.store);
+  data.area = text_(profile.area);
+  data.phone = normalisePhone_(profile.phone);
+  data.defaultAddress = text_(profile.defaultAddress);
   data.createdAt = now;
   data.linkedAt = now;
   const row = objectToRow_(sheet, map, data);
