@@ -1,60 +1,76 @@
 /**
  * ZIPDAM Backend - Google Apps Script Web App
+ *
+ * Canonical customer identity:
+ *   customerId === lineUserId (LINE user ID beginning with "U")
+ * Same LINE ID is always one customer, even if displayName changes.
+ *
  * Endpoints:
- *  - GET  ?action=catalog
- *  - POST {action:"order", idToken, lineUserId, displayName, store, area, address, phone, cart:[{Brand,Size,Name,qty}]}
- *  - POST {action:"me", idToken}
- *  - POST {action:"favorites_get|favorites_add|favorites_remove", idToken, item?}
- *  - POST {action:"templates_get|templates_add|templates_delete", idToken, ...}
- *  - POST {action:"frequent_get", idToken, limit}
- *  - POST {action:"customer_profile|customer_profile_set", idToken?, lineUserId?, ...}
+ *   GET  ?action=catalog
+ *   GET  ?action=health
+ *   POST {action:"order", idToken, lineUserId, displayName, store, area, address, phone, cart:[...]}
+ *   POST {action:"me", idToken?, lineUserId?}
+ *   POST {action:"customer_profile|customer_profile_set", ...}
+ *   POST {action:"customer_summary", idToken?, lineUserId?}
+ *   POST {action:"favorites_get|favorites_add|favorites_remove", ...}
+ *   POST {action:"templates_get|templates_add|templates_delete", ...}
+ *   POST {action:"frequent_get", idToken?, lineUserId?, limit}
  */
 
-/** ====== CONFIG ====== */
+const ZIPDAM_SCHEMA = Object.freeze({
+  Product: ['SKU', 'Brand', 'Feature', 'Size', 'Name', 'mm', 'pack', 'price', 'promo_price', 'image_key', 'active', 'Cost'],
+  Customer: ['lineUserId', 'customerId', 'name', 'displayName', 'store', 'area', 'phone', 'defaultAddress', 'createdAt', 'lastSeenAt'],
+  Orders: ['OrderID', 'CreatedAt', 'lineUserId', 'displayName', 'customerId', 'store', 'itemsTotal', 'shippingFee', 'grandTotal', 'status', 'address', 'phone'],
+  OrderItems: ['OrderID', 'SKU', 'Brand', 'Size', 'Name', 'qty', 'unitPrice', 'lineTotal'],
+  Favorites: ['lineUserId', 'SKU', 'Brand', 'Size', 'Name', 'createdAt', 'updatedAt'],
+  Templates: ['templateId', 'lineUserId', 'templateName', 'itemsJson', 'createdAt', 'updatedAt', 'lastUsedAt'],
+  Rewards: ['RewardID', 'RewardName', 'RequiredSpend', 'RequiredPoints', 'RewardType', 'RewardValue', 'Active', 'StartDate', 'EndDate', 'Note']
+});
+
 function getConfig_() {
-  // Hard-coded config so Script Properties are no longer required.
-  // TODO: update LINE_MESSAGING_TOKEN with your real channel access token.
-  const SHEET_ID = '11sUClcToFNjQXafrZUgRaLGZW3NO2-cAfSIxe2IgsoE';
-  const LINE_LOGIN_CHANNEL_ID = '2008727011';
-  const LINE_MESSAGING_TOKEN = '6W4tvkhwl5GbmBKHLr4D3P5wLhjUaO1Ak5WJYArUZXTehnwHmodl+KJG3GWc6bMfLfzXUVkTWTdrE6IHeQ7Id10/z+/tpN4hLLjyPuh5e2efRC/ADXgjAljHuFwinVGbXNiBylywsemWI3Ikm/YXDQdB04t89/1O/w1cDnyilFU=';
-  const N8N_WEBHOOK_URL = 'https://n8n.srv1112305.hstgr.cloud/webhook-test/zipdam';
-  const FIXED_SHIPPING = 20;
-  const LOW_ORDER_SHIPPING = 30;
-  const SHIPPING_THRESHOLD = 200;
-  const ADMIN_LINE_USER_ID = 'U1d0318233f66c6ddc1fd998e49c5dcef'; // notify admin on new order
+  const props = PropertiesService.getScriptProperties();
 
   return {
-    SHEET_ID,
-    LINE_LOGIN_CHANNEL_ID,
-    LINE_MESSAGING_TOKEN,
-    N8N_WEBHOOK_URL,
-    FIXED_SHIPPING,
-    LOW_ORDER_SHIPPING,
-    SHIPPING_THRESHOLD,
-    ADMIN_LINE_USER_ID
+    SHEET_ID: props.getProperty('SHEET_ID') || '11sUClcToFNjQXafrZUgRaLGZW3NO2-cAfSIxe2IgsoE',
+    LINE_LOGIN_CHANNEL_ID: props.getProperty('LINE_LOGIN_CHANNEL_ID') || '2008727011',
+    LINE_MESSAGING_TOKEN: props.getProperty('LINE_MESSAGING_TOKEN') || '',
+    N8N_WEBHOOK_URL: props.getProperty('N8N_WEBHOOK_URL') || '',
+    ADMIN_LINE_USER_ID: props.getProperty('ADMIN_LINE_USER_ID') || 'U1d0318233f66c6ddc1fd998e49c5dcef',
+    FIXED_SHIPPING: numberProperty_(props, 'FIXED_SHIPPING', 20),
+    LOW_ORDER_SHIPPING: numberProperty_(props, 'LOW_ORDER_SHIPPING', 30),
+    SHIPPING_THRESHOLD: numberProperty_(props, 'SHIPPING_THRESHOLD', 200),
+    ALLOW_GUEST_ORDERS: boolProperty_(props, 'ALLOW_GUEST_ORDERS', true),
+    ALLOW_LINE_ID_MISMATCH: boolProperty_(props, 'ALLOW_LINE_ID_MISMATCH', false)
   };
 }
 
-function json_(obj, code) {
-  const out = ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-  // Apps Script Web App ไม่รองรับ setStatusCode โดยตรงใน ContentService
-  // แต่เราจะใส่ ok/error ใน JSON แทน
-  return out;
+function numberProperty_(props, key, fallback) {
+  const raw = props.getProperty(key);
+  if (raw === null || raw === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
 }
 
-/** ====== ENTRYPOINTS ====== */
+function boolProperty_(props, key, fallback) {
+  const raw = props.getProperty(key);
+  if (raw === null || raw === '') return fallback;
+  return String(raw).toLowerCase() === 'true';
+}
+
+function json_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
 function doGet(e) {
   try {
-    const action = (e && e.parameter && e.parameter.action) ? String(e.parameter.action) : '';
-    if (action === 'catalog') {
-      const catalog = getCatalog_();
-      return json_({ ok: true, catalog });
-    }
-    return json_({ ok: false, error: 'Unknown action (GET). Use ?action=catalog' });
+    const action = String(e?.parameter?.action || '');
+    if (action === 'catalog') return json_({ ok: true, catalog: getCatalog_() });
+    if (action === 'health') return json_(getHealth_());
+    return json_({ ok: false, error: 'Unknown GET action. Use catalog or health.' });
   } catch (err) {
-    return json_({ ok: false, error: String(err && err.message ? err.message : err) });
+    return json_({ ok: false, error: errorMessage_(err) });
   }
 }
 
@@ -64,330 +80,496 @@ function doPost(e) {
     const action = String(body.action || '');
 
     switch (action) {
-      case 'me': return json_(handleMe_(body));
       case 'order': return json_(handleOrder_(body));
-
+      case 'me': return json_(handleMe_(body));
+      case 'customer_profile': return json_(handleCustomerProfileGet_(body));
+      case 'customer_profile_set': return json_(handleCustomerProfileSet_(body));
+      case 'customer_summary': return json_(handleCustomerSummary_(body));
       case 'favorites_get': return json_(handleFavoritesGet_(body));
       case 'favorites_add': return json_(handleFavoritesAdd_(body));
       case 'favorites_remove': return json_(handleFavoritesRemove_(body));
-
       case 'templates_get': return json_(handleTemplatesGet_(body));
       case 'templates_add': return json_(handleTemplatesAdd_(body));
       case 'templates_delete': return json_(handleTemplatesDelete_(body));
-
       case 'frequent_get': return json_(handleFrequentGet_(body));
-      case 'customer_profile': return json_(handleCustomerProfileGet_(body));
-      case 'customer_profile_set': return json_(handleCustomerProfileSet_(body));
-
-      default:
-        return json_({ ok: false, error: 'Unknown action (POST)' });
+      default: return json_({ ok: false, error: 'Unknown POST action.' });
     }
   } catch (err) {
-    return json_({ ok: false, error: String(err && err.message ? err.message : err) });
+    return json_({ ok: false, error: errorMessage_(err) });
   }
 }
 
-/** ====== PARSING / VALIDATION ====== */
 function parseJsonBody_(e) {
-  if (!e || !e.postData || !e.postData.contents) return {};
-  const txt = e.postData.contents;
-  try { return JSON.parse(txt); } catch (_) { throw new Error('Invalid JSON body'); }
+  if (!e?.postData?.contents) return {};
+  try {
+    return JSON.parse(e.postData.contents);
+  } catch (_) {
+    throw new Error('Invalid JSON body');
+  }
 }
 
-function assert_(cond, msg) {
-  if (!cond) throw new Error(msg);
+function errorMessage_(err) {
+  return String(err?.message || err || 'Unknown error');
 }
 
-function toNumber_(v) {
-  const n = Number(v);
-  return isFinite(n) ? n : 0;
+function assert_(condition, message) {
+  if (!condition) throw new Error(message);
 }
 
-function formatTHB_(n) {
-  return '฿' + Number(n || 0).toLocaleString('th-TH');
+function text_(value) {
+  return String(value ?? '').trim();
+}
+
+function toNumber_(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function nowIso_() {
   return new Date().toISOString();
 }
 
-/** ====== LINE ID TOKEN VERIFY ======
- * Uses LINE verify endpoint:
- * POST https://api.line.me/oauth2/v2.1/verify (x-www-form-urlencoded)
- * params: id_token, client_id
- */
+function isRealLineUserId_(value) {
+  return /^U[0-9a-f]{32}$/i.test(text_(value));
+}
+
+function formatTHB_(value) {
+  return '฿' + Number(value || 0).toLocaleString('th-TH');
+}
+
+/* =========================
+ * LINE IDENTITY
+ * ========================= */
+
 function verifyLineIdToken_(idToken) {
   const { LINE_LOGIN_CHANNEL_ID } = getConfig_();
-  assert_(idToken && typeof idToken === 'string', 'Missing idToken');
+  assert_(text_(idToken), 'Missing idToken');
 
-  const url = 'https://api.line.me/oauth2/v2.1/verify';
-  const payload = {
-    id_token: idToken,
-    client_id: LINE_LOGIN_CHANNEL_ID
-  };
-
-  const options = {
+  const response = UrlFetchApp.fetch('https://api.line.me/oauth2/v2.1/verify', {
     method: 'post',
     contentType: 'application/x-www-form-urlencoded',
-    payload,
+    payload: {
+      id_token: idToken,
+      client_id: LINE_LOGIN_CHANNEL_ID
+    },
     muteHttpExceptions: true
-  };
-
-  const res = UrlFetchApp.fetch(url, options);
-  const code = res.getResponseCode();
-  const text = res.getContentText();
-  let data = {};
-  try { data = JSON.parse(text); } catch (_) {}
-
-  // สำเร็จจะได้ sub (user id), name, picture, email(ถ้ามี) ฯลฯ
-  if (code !== 200) {
-    throw new Error('LINE token verify failed: ' + (data.error_description || data.error || text));
-  }
-  assert_(data.sub, 'LINE verify ok but missing sub');
-  return data; // {sub,name,picture, ...}
-}
-
-/** ====== SHEET HELPERS ====== */
-function openDb_() {
-  const { SHEET_ID } = getConfig_();
-  return SpreadsheetApp.openById(SHEET_ID);
-}
-
-function getSheet_(name) {
-  const ss = openDb_();
-  const sh = ss.getSheetByName(name);
-  if (!sh) throw new Error('Missing sheet: ' + name);
-  return sh;
-}
-
-function getHeaderMap_(sheet) {
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const map = {};
-  headers.forEach((h, idx) => {
-    const key = String(h || '').trim();
-    if (key) map[key] = idx + 1; // 1-based col index
   });
-  return map;
-}
 
-function getLastRowValues_(sheet, n) {
-  const last = sheet.getLastRow();
-  if (last < 2) return [];
-  const start = Math.max(2, last - n + 1);
-  const num = last - start + 1;
-  return sheet.getRange(start, 1, num, sheet.getLastColumn()).getValues();
-}
+  const status = response.getResponseCode();
+  const raw = response.getContentText();
+  let data = {};
+  try { data = JSON.parse(raw); } catch (_) {}
 
-/** ====== CATALOG ====== */
-function getCatalog_() {
-  const sh = getSheet_('Product');
-  const map = getHeaderMap_(sh);
-  const last = sh.getLastRow();
-  if (last < 2) return [];
-
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-
-  // รองรับทั้ง “ไฟล์ใหม่” และ “ไฟล์เดิม” โดยใช้ชื่อหัวคอลัมน์
-  // ใหม่ (ที่แนะนำ): SKU, Brand, Type, Feature, Size, Name, mm, pack, price, promo_price, image_key, active
-  // เดิม: Brand, Size, Name, ขนาด (มม.), บรรจุ (ชิ้น/กล่อง), ราคา/กล่อง (บาท)
-  const col = (name, fallbackName) => map[name] || (fallbackName ? map[fallbackName] : null);
-
-  const cSKU = col('SKU');
-  const cBrand = col('Brand');
-  const cType = col('Type');
-  const cFeature = col('Feature');
-  const cSize = col('Size');
-  const cName = col('Name');
-  const cMM = col('mm', 'ขนาด (มม.)');
-  const cPack = col('pack', 'บรรจุ (ชิ้น/กล่อง)');
-  const cPrice = col('price', 'ราคา/กล่อง (บาท)');
-  const cPromo = col('promo_price', 'Promo Price');
-  const cImgKey = col('image_key', 'Image Key');
-  const cActive = col('active');
-
-  const out = [];
-
-  for (const r of values) {
-    const brand = cBrand ? r[cBrand - 1] : null;
-    const name = cName ? r[cName - 1] : null;
-    if (!brand || !name) continue;
-
-    const active = cActive ? r[cActive - 1] : true;
-    if (active === false || String(active).toLowerCase() === 'false') continue;
-
-    const price = toNumber_(cPrice ? r[cPrice - 1] : 0);
-    const promo = cPromo ? toNumber_(r[cPromo - 1]) : 0;
-    const finalPrice = (promo && promo > 0) ? promo : price;
-
-    const featureRaw = cFeature ? String(r[cFeature - 1] || '').trim() : '';
-    const featureTags = featureRaw ? featureRaw.split('|').map(s => s.trim()).filter(Boolean) : [];
-
-    out.push({
-      SKU: cSKU ? (r[cSKU - 1] || '') : '',
-      Brand: brand,
-      Type: cType ? (r[cType - 1] || '') : '',
-      Feature: featureTags,
-      Size: cSize ? (r[cSize - 1] || '') : '',
-      Name: name,
-      mm: cMM ? (r[cMM - 1] || '') : '',
-      pack: cPack ? (r[cPack - 1] || '') : '',
-      price: price,
-      promo_price: (promo && promo > 0) ? promo : null,
-      final_price: finalPrice,
-      image_key: cImgKey ? (r[cImgKey - 1] || '') : ''
-    });
+  if (status !== 200) {
+    throw new Error('LINE token verify failed: ' + (data.error_description || data.error || raw));
   }
-  return out;
+
+  assert_(data.sub, 'LINE token is valid but sub is missing');
+  return data;
 }
 
-function buildProductIndex_() {
-  const catalog = getCatalog_();
-  const idx = new Map();
-  const skuIdx = new Map();
-  for (const p of catalog) {
-    const key = `${p.Brand}||${p.Size}||${p.Name}`;
-    idx.set(key, p);
-    if (p.SKU) skuIdx.set(String(p.SKU), p);
-  }
-  return { idx, skuIdx };
-}
+function resolveIdentity_(body, options) {
+  const settings = Object.assign({
+    requireLine: false,
+    allowGuest: false
+  }, options || {});
 
-function getShippingFee_(itemsTotal) {
-  const { FIXED_SHIPPING, LOW_ORDER_SHIPPING, SHIPPING_THRESHOLD } = getConfig_();
-  if (toNumber_(itemsTotal) <= 0) return 0;
-  return itemsTotal < SHIPPING_THRESHOLD ? LOW_ORDER_SHIPPING : FIXED_SHIPPING;
-}
+  const config = getConfig_();
+  const providedLineUserId = text_(body.lineUserId);
+  const providedDisplayName = text_(body.displayName);
 
-/** ====== ORDER HANDLER ====== */
-function handleOrder_(body) {
-  const { LINE_MESSAGING_TOKEN, N8N_WEBHOOK_URL, ADMIN_LINE_USER_ID } = getConfig_();
-  const idToken = body.idToken || '';
-  const cart = body.cart;
-
-  assert_(Array.isArray(cart) && cart.length > 0, 'Cart is empty');
+  let verified = null;
   let tokenVerified = false;
   let tokenError = '';
-  let verified;
 
-  if (idToken) {
+  if (text_(body.idToken)) {
     try {
-      verified = verifyLineIdToken_(idToken);
+      verified = verifyLineIdToken_(body.idToken);
       tokenVerified = true;
     } catch (err) {
-      tokenError = String(err && err.message ? err.message : err);
-      // Allow order to proceed even if token expired/invalid (no auth-based features).
-      verified = {
-        sub: body.lineUserId || `GUEST-${Date.now()}`,
-        name: body.displayName || 'Guest',
-      };
+      tokenError = errorMessage_(err);
     }
-  } else {
-    verified = {
-      sub: body.lineUserId || `GUEST-${Date.now()}`,
-      name: body.displayName || 'Guest',
+  }
+
+  const verifiedLineUserId = isRealLineUserId_(verified?.sub) ? text_(verified.sub) : '';
+  const bodyLineUserId = isRealLineUserId_(providedLineUserId) ? providedLineUserId : '';
+
+  if (
+    verifiedLineUserId &&
+    bodyLineUserId &&
+    verifiedLineUserId !== bodyLineUserId &&
+    !config.ALLOW_LINE_ID_MISMATCH
+  ) {
+    throw new Error('LINE identity mismatch');
+  }
+
+  const lineUserId = bodyLineUserId || verifiedLineUserId;
+  const displayName = providedDisplayName || text_(verified?.name) || 'Guest';
+
+  if (lineUserId) {
+    return {
+      lineUserId,
+      customerId: lineUserId,
+      displayName,
+      tokenVerified,
+      tokenError,
+      isGuest: false
     };
   }
 
-  const loginSub = verified.sub;
-  const displayName = verified.name || '';
+  if (settings.requireLine || !settings.allowGuest || !config.ALLOW_GUEST_ORDERS) {
+    throw new Error('Please open this page inside LINE and log in again');
+  }
 
-  const bodyLineUserId = String(body.lineUserId || '').trim();
-  // Prefer the Messaging API userId if provided; fallback to loginSub/guest id.
-  const lineUserId = (bodyLineUserId && bodyLineUserId.startsWith('U')) ? bodyLineUserId : loginSub;
+  const guestId = 'GUEST-' + Date.now();
+  return {
+    lineUserId: guestId,
+    customerId: '',
+    displayName: displayName || 'Guest',
+    tokenVerified,
+    tokenError,
+    isGuest: true
+  };
+}
 
-  // ensure customer row exists/update lastSeen (keyed by login sub/guest)
-  const existingProfile = getCustomerProfile_(loginSub);
-  const providedStore = String(body.store || body.storeName || '').trim();
-  const providedArea = String(body.soi || body.area || '').trim();
-  const providedAddress = String(body.address || body.defaultAddress || '').trim();
-  const providedPhone = String(body.phone || '').trim();
+/* =========================
+ * SHEET HELPERS
+ * ========================= */
 
-  const store = providedStore || existingProfile.store || '';
-  const area = providedArea || existingProfile.area || '';
-  const address = providedAddress || existingProfile.address || existingProfile.defaultAddress || '';
-  const phone = providedPhone || existingProfile.phone || '';
+function openDb_() {
+  return SpreadsheetApp.openById(getConfig_().SHEET_ID);
+}
 
-  upsertCustomer_(loginSub, displayName, address, phone, store, area);
+function getSheet_(name) {
+  const sheet = openDb_().getSheetByName(name);
+  if (!sheet) throw new Error('Missing sheet: ' + name);
+  return sheet;
+}
 
-  const { idx: productIndex, skuIdx } = buildProductIndex_();
+function getHeaderMap_(sheet) {
+  const lastColumn = sheet.getLastColumn();
+  assert_(lastColumn > 0, 'Sheet has no columns: ' + sheet.getName());
 
-  let itemsTotal = 0;
-  const itemsToWrite = [];
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const map = {};
 
-  for (const item of cart) {
-    const rawSku = String(item.SKU || item.id || '').trim();
-    const Brand = String(item.Brand || item.brand || '').trim();
-    const Size = String(item.Size || item.size || '').trim();
-    const Name = String(item.Name || item.name || '').trim();
-    const qty = Math.floor(Number(item.qty || item.quantity || 0));
+  headers.forEach((header, index) => {
+    const key = text_(header);
+    if (!key) return;
+    if (map[key]) throw new Error(`Duplicate header "${key}" in ${sheet.getName()}`);
+    map[key] = index + 1;
+  });
 
-    assert_(qty > 0, 'qty must be > 0');
+  return map;
+}
 
-    let p = rawSku ? skuIdx.get(rawSku) : null;
-    if (!p && (Brand || Name)) {
-      const key = `${Brand}||${Size}||${Name}`;
-      p = productIndex.get(key);
-      if (!p && Brand && Name) {
-        // attempt match ignoring Size mismatch
-        for (const candidate of productIndex.values()) {
-          if (candidate.Brand === Brand && candidate.Name === Name) { p = candidate; break; }
-        }
+function assertHeaders_(sheetName, requiredHeaders) {
+  const sheet = getSheet_(sheetName);
+  const map = getHeaderMap_(sheet);
+  const missing = requiredHeaders.filter(header => !map[header]);
+  if (missing.length) {
+    throw new Error(`${sheetName} missing columns: ${missing.join(', ')}`);
+  }
+  return { sheet, map };
+}
+
+function objectToRow_(sheet, headerMap, data) {
+  const row = new Array(sheet.getLastColumn()).fill('');
+  Object.keys(data).forEach(key => {
+    const column = headerMap[key];
+    if (column) row[column - 1] = data[key];
+  });
+  return row;
+}
+
+function appendObjectRow_(sheetName, data, requiredHeaders) {
+  const { sheet, map } = assertHeaders_(sheetName, requiredHeaders || []);
+  const row = objectToRow_(sheet, map, data);
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+}
+
+function appendObjectRows_(sheetName, dataRows, requiredHeaders) {
+  if (!dataRows.length) return;
+  const { sheet, map } = assertHeaders_(sheetName, requiredHeaders || []);
+  const rows = dataRows.map(data => objectToRow_(sheet, map, data));
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, sheet.getLastColumn()).setValues(rows);
+}
+
+function findRowByValue_(sheet, column, value) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const finder = sheet
+    .getRange(2, column, lastRow - 1, 1)
+    .createTextFinder(String(value))
+    .matchEntireCell(true)
+    .findNext();
+
+  return finder ? finder.getRow() : 0;
+}
+
+function updateObjectRow_(sheet, rowNumber, headerMap, data) {
+  Object.keys(data).forEach(key => {
+    const column = headerMap[key];
+    if (!column) return;
+    sheet.getRange(rowNumber, column).setValue(data[key]);
+  });
+}
+
+function getHealth_() {
+  const checks = {};
+  Object.keys(ZIPDAM_SCHEMA).forEach(sheetName => {
+    try {
+      const sheet = getSheet_(sheetName);
+      const map = getHeaderMap_(sheet);
+      const missing = ZIPDAM_SCHEMA[sheetName].filter(header => !map[header]);
+      checks[sheetName] = {
+        ok: missing.length === 0,
+        missing,
+        headers: Object.keys(map)
+      };
+    } catch (err) {
+      checks[sheetName] = { ok: false, error: errorMessage_(err) };
+    }
+  });
+
+  return {
+    ok: Object.values(checks).every(check => check.ok),
+    customerKey: 'LINE userId',
+    checks
+  };
+}
+
+/* =========================
+ * CATALOG
+ * ========================= */
+
+function getCatalog_() {
+  const { sheet, map } = assertHeaders_('Product', ['SKU', 'Brand', 'Size', 'Name', 'price']);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  return rows
+    .map(row => {
+      const value = header => map[header] ? row[map[header] - 1] : '';
+      const active = map.active ? value('active') : true;
+      if (active === false || text_(active).toLowerCase() === 'false') return null;
+
+      const regularPrice = toNumber_(value('price'));
+      const promoPrice = toNumber_(value('promo_price'));
+
+      return {
+        SKU: text_(value('SKU')),
+        Brand: text_(value('Brand')),
+        Feature: text_(value('Feature'))
+          .split('|')
+          .map(part => part.trim())
+          .filter(Boolean),
+        Size: text_(value('Size')),
+        Name: text_(value('Name')),
+        mm: value('mm'),
+        pack: value('pack'),
+        price: regularPrice,
+        promo_price: promoPrice > 0 ? promoPrice : null,
+        final_price: promoPrice > 0 ? promoPrice : regularPrice,
+        image_key: text_(value('image_key'))
+      };
+    })
+    .filter(product => product && product.Brand && product.Name);
+}
+
+function buildProductIndex_() {
+  const { sheet, map } = assertHeaders_('Product', ['SKU', 'Brand', 'Size', 'Name', 'price']);
+  const lastRow = sheet.getLastRow();
+  const bySku = new Map();
+  const byKey = new Map();
+
+  if (lastRow < 2) return { bySku, byKey };
+
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  rows.forEach(row => {
+    const value = header => map[header] ? row[map[header] - 1] : '';
+    const active = map.active ? value('active') : true;
+    if (active === false || text_(active).toLowerCase() === 'false') return;
+
+    const regularPrice = toNumber_(value('price'));
+    const promoPrice = toNumber_(value('promo_price'));
+    const product = {
+      SKU: text_(value('SKU')),
+      Brand: text_(value('Brand')),
+      Size: text_(value('Size')),
+      Name: text_(value('Name')),
+      pack: value('pack'),
+      finalPrice: promoPrice > 0 ? promoPrice : regularPrice,
+      unitCost: toNumber_(value('Cost'))
+    };
+
+    if (!product.Brand || !product.Name) return;
+    if (product.SKU) bySku.set(product.SKU, product);
+    byKey.set(productKey_(product.Brand, product.Size, product.Name), product);
+  });
+
+  return { bySku, byKey };
+}
+
+function productKey_(brand, size, name) {
+  return [brand, size, name].map(value => text_(value).toLowerCase()).join('||');
+}
+
+function resolveProduct_(item, index) {
+  const sku = text_(item.SKU || item.id);
+  const brand = text_(item.Brand || item.brand);
+  const size = text_(item.Size || item.size);
+  const name = text_(item.Name || item.name);
+
+  let product = sku ? index.bySku.get(sku) : null;
+  if (!product) product = index.byKey.get(productKey_(brand, size, name));
+
+  if (!product && brand && name) {
+    for (const candidate of index.bySku.values()) {
+      if (
+        candidate.Brand.toLowerCase() === brand.toLowerCase() &&
+        candidate.Name.toLowerCase() === name.toLowerCase()
+      ) {
+        product = candidate;
+        break;
       }
     }
+  }
 
-    assert_(p, `Product not found: ${Brand || rawSku} / ${Size} / ${Name}`);
+  assert_(product, `Product not found: ${sku || brand} / ${size} / ${name}`);
+  return product;
+}
 
-    const unitPrice = toNumber_(p.final_price);
-    const lineTotal = unitPrice * qty;
+function getShippingFee_(itemsTotal) {
+  const config = getConfig_();
+  if (itemsTotal <= 0) return 0;
+  return itemsTotal < config.SHIPPING_THRESHOLD
+    ? config.LOW_ORDER_SHIPPING
+    : config.FIXED_SHIPPING;
+}
 
-    itemsTotal += lineTotal;
+/* =========================
+ * ORDERS
+ * ========================= */
 
-    itemsToWrite.push({
-      SKU: p.SKU || rawSku || '',
-      Brand: Brand || p.Brand || '',
-      Size: Size || p.Size || '',
-      Name: Name || p.Name || '',
-      pack: p.pack || '',
-      qty,
-      unitPrice,
-      lineTotal
+function handleOrder_(body) {
+  const cart = Array.isArray(body.cart) ? body.cart : [];
+  assert_(cart.length > 0, 'Cart is empty');
+
+  const identity = resolveIdentity_(body, { allowGuest: true });
+  const profile = identity.isGuest ? emptyProfile_() : getCustomerProfile_(identity.lineUserId);
+
+  const store = text_(body.store || body.storeName) || profile.store;
+  const area = text_(body.area || body.soi) || profile.area;
+  const address = text_(body.address || body.defaultAddress) || profile.defaultAddress;
+  const phone = normalisePhone_(body.phone) || profile.phone;
+
+  if (!identity.isGuest) {
+    upsertCustomer_({
+      lineUserId: identity.lineUserId,
+      displayName: identity.displayName,
+      store,
+      area,
+      phone,
+      defaultAddress: address
     });
   }
 
-  itemsTotal = Math.round(itemsTotal);
+  const productIndex = buildProductIndex_();
+  const items = cart.map(item => {
+    const quantity = Math.floor(toNumber_(item.qty || item.quantity));
+    assert_(quantity > 0, 'qty must be > 0');
+
+    const product = resolveProduct_(item, productIndex);
+    const unitPrice = product.finalPrice;
+    const lineTotal = Math.round(unitPrice * quantity);
+    const totalCost = Math.round(product.unitCost * quantity * 100) / 100;
+    const profit = Math.round((lineTotal - totalCost) * 100) / 100;
+
+    return {
+      SKU: product.SKU,
+      Brand: text_(item.Brand || item.brand) || product.Brand,
+      Size: text_(item.Size || item.size) || product.Size,
+      Name: text_(item.Name || item.name) || product.Name,
+      pack: product.pack,
+      qty: quantity,
+      unitPrice,
+      lineTotal,
+      Cost: totalCost,
+      Profit: profit
+    };
+  });
+
+  const itemsTotal = Math.round(items.reduce((sum, item) => sum + item.lineTotal, 0));
   const shippingFee = getShippingFee_(itemsTotal);
   const grandTotal = itemsTotal + shippingFee;
-
   const orderId = getNextOrderId_();
+  const createdAt = nowIso_();
+  const orderMode = ['SELF', 'ADMIN', 'LEGACY'].includes(text_(body.orderMode).toUpperCase())
+    ? text_(body.orderMode).toUpperCase()
+    : 'SELF';
 
-  // write to sheets
-  appendOrder_(orderId, lineUserId, displayName, itemsTotal, shippingFee, grandTotal, loginSub, address, phone, store, area);
-  appendOrderItems_(orderId, itemsToWrite);
-  let linePush = { attempted: false, ok: false };
-  let adminPush = { attempted: false, ok: false };
-  try {
-    linePush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, lineUserId, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address, phone) || linePush;
-  } catch (err) {
-    console.error('pushLineOrderConfirm_ call failed', err);
-    linePush = { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
-  }
-  try {
-    if (ADMIN_LINE_USER_ID) {
-      // Reuse the same messaging token/settings as customer confirmation, but deliver to admin userId.
-      adminPush = pushLineOrderConfirm_(LINE_MESSAGING_TOKEN, ADMIN_LINE_USER_ID, orderId, itemsToWrite, itemsTotal, shippingFee, grandTotal, displayName, address, phone) || adminPush;
-    }
-  } catch (err) {
-    console.error('admin push failed', err);
-    adminPush = { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
-  }
-  console.log('linePush', JSON.stringify(linePush));
-  console.log('adminPush', JSON.stringify(adminPush));
+  appendOrder_({
+    OrderID: orderId,
+    CreatedAt: createdAt,
+    lineUserId: identity.lineUserId,
+    displayName: identity.displayName,
+    customerId: identity.customerId,
+    store,
+    itemsTotal,
+    shippingFee,
+    grandTotal,
+    status: 'CONFIRMED',
+    address,
+    phone,
+    note: text_(body.note),
+    createdByLineUserId: identity.lineUserId,
+    orderMode,
+    loyaltyStatus: identity.isGuest ? 'EXCLUDED' : 'PENDING',
+    pointsEarned: '',
+    rewardApplied: ''
+  });
 
-  const n8nPush = sendN8NWebhook_(N8N_WEBHOOK_URL, {
+  appendOrderItems_(orderId, items);
+
+  const config = getConfig_();
+  const linePush = safePushOrderConfirmation_(
+    config.LINE_MESSAGING_TOKEN,
+    identity.lineUserId,
     orderId,
-    lineUserId,
-    loginSub,
-    displayName,
+    items,
+    itemsTotal,
+    shippingFee,
+    grandTotal,
+    identity.displayName,
+    address,
+    phone
+  );
+
+  const adminPush = config.ADMIN_LINE_USER_ID && config.ADMIN_LINE_USER_ID !== identity.lineUserId
+    ? safePushOrderConfirmation_(
+        config.LINE_MESSAGING_TOKEN,
+        config.ADMIN_LINE_USER_ID,
+        orderId,
+        items,
+        itemsTotal,
+        shippingFee,
+        grandTotal,
+        identity.displayName,
+        address,
+        phone
+      )
+    : { attempted: false, ok: false };
+
+  const n8nPush = sendN8NWebhook_(config.N8N_WEBHOOK_URL, {
+    orderId,
+    createdAt,
+    lineUserId: identity.lineUserId,
+    customerId: identity.customerId,
+    displayName: identity.displayName,
     store,
     area,
     address,
@@ -395,239 +577,62 @@ function handleOrder_(body) {
     itemsTotal,
     shippingFee,
     grandTotal,
-    cart,
-    linePush,
-    tokenVerified,
-    tokenError,
-    createdAt: nowIso_(),
+    orderMode,
+    cart: items,
+    tokenVerified: identity.tokenVerified,
+    tokenError: identity.tokenError
   });
-  console.log('n8nPush', JSON.stringify(n8nPush));
 
   return {
     ok: true,
     orderId,
-    lineUserId,
-    loginSub,
-    displayName,
+    lineUserId: identity.lineUserId,
+    customerId: identity.customerId,
+    displayName: identity.displayName,
     store,
     area,
     address,
     phone,
-    tokenVerified,
-    tokenError,
     itemsTotal,
     shippingFee,
     grandTotal,
+    tokenVerified: identity.tokenVerified,
+    tokenError: identity.tokenError,
     linePush,
     adminPush,
     n8nPush
   };
 }
 
-function appendOrder_(orderId, lineUserId, displayName, itemsTotal, shippingFee, grandTotal, customerId, address, phone, store, area) {
-  const sh = getSheet_('Orders');
-  const map = getHeaderMap_(sh);
-
-  // รองรับหัวคอลัมน์ตามไฟล์ที่ผมทำให้:
-  // OrderID, CreatedAt, lineUserId, displayName, customerId, store, itemsTotal, shippingFee, grandTotal, status, paymentStatus, paidAt, address, phone, note
-  const row = new Array(sh.getLastColumn()).fill('');
-
-  function set(colName, val) {
-    const c = map[colName];
-    if (c) row[c - 1] = val;
-  }
-
-  set('OrderID', orderId);
-  set('CreatedAt', nowIso_());
-  set('lineUserId', lineUserId);
-  set('displayName', displayName);
-  set('customerId', customerId || '');
-  set('store', store || '');
-  set('area', area || '');
-  set('itemsTotal', itemsTotal);
-  set('shippingFee', shippingFee);
-  set('grandTotal', grandTotal);
-  set('address', address || '');
-  set('phone', phone || '');
-  set('status', 'CONFIRMED');        // หรือ NEW ก็ได้
-  set('paymentStatus', 'UNPAID');    // เริ่มต้น
-
-  sh.appendRow(row);
+function appendOrder_(order) {
+  appendObjectRow_('Orders', order, ZIPDAM_SCHEMA.Orders);
 }
 
 function appendOrderItems_(orderId, items) {
-  const sh = getSheet_('OrderItems');
-  const map = getHeaderMap_(sh);
+  const rows = items.map(item => ({
+    OrderID: orderId,
+    SKU: item.SKU,
+    Brand: item.Brand,
+    Size: item.Size,
+    Name: item.Name,
+    qty: item.qty,
+    unitPrice: item.unitPrice,
+    lineTotal: item.lineTotal,
+    Profit: item.Profit,
+    Cost: item.Cost
+  }));
 
-  // รองรับหัวคอลัมน์ตามไฟล์ที่ผมทำให้:
-  // OrderID, SKU, Brand, Size, Name, qty, unitPrice, lineTotal
-  const rows = items.map(it => {
-    const row = new Array(sh.getLastColumn()).fill('');
-    function set(colName, val) {
-      const c = map[colName];
-      if (c) row[c - 1] = val;
-    }
-    set('OrderID', orderId);
-    set('SKU', it.SKU || '');
-    set('Brand', it.Brand);
-    set('Size', it.Size);
-    set('Name', it.Name);
-    set('qty', it.qty);
-    set('unitPrice', it.unitPrice);
-    set('lineTotal', it.lineTotal);
-    return row;
-  });
-
-  if (rows.length) {
-    sh.getRange(sh.getLastRow() + 1, 1, rows.length, sh.getLastColumn()).setValues(rows);
-  }
+  appendObjectRows_('OrderItems', rows, ZIPDAM_SCHEMA.OrderItems);
 }
 
-function pushLineOrderConfirm_(token, lineUserId, orderId, items, itemsTotal, shippingFee, grandTotal, displayName, address, phone) {
-  if (!token) return { attempted: false, ok: false, error: 'Missing LINE_MESSAGING_TOKEN' };
-  if (!lineUserId || !String(lineUserId).startsWith('U')) return { attempted: false, ok: false, error: 'Missing/invalid lineUserId' };
-
-  try {
-    const lines = Array.isArray(items) ? items : [];
-    const itemLines = lines.map((it, idx) => {
-      const namePart = `${it.Name || ''}`.trim();
-      const rawSize = String(it.Size || '').trim();
-      const normalizedSize = rawSize.replace(/\s*mm$/i, '').trim();
-      const sizeLabel = normalizedSize ? ` ${normalizedSize}` : '';
-      const packLabel = it.pack ? ` (${it.pack}ชิ้น)` : '';
-      const unitLabel = `ราคากล่องละ ${formatTHB_(it.unitPrice)}`;
-      const qtyLabel = `จำนวน ${it.qty} กล่อง`;
-      const lineTotalLabel = `รวม ${formatTHB_(it.lineTotal)}`;
-      return [
-        `${idx + 1}) ${namePart}${sizeLabel}${packLabel}`,
-        `   📦 ${qtyLabel}`,
-        `   💰 ${unitLabel}`,
-        `   🔸 ${lineTotalLabel}`
-      ].join('\n');
-    });
-
-    const text = [
-      '🧾 ยืนยันคำสั่งซื้อ ZIPDAM',
-      `Order: ${orderId}`,
-      `ลูกค้า: ${displayName || '-'}`,
-      `ที่อยู่: ${address || '-'}`,
-      `โทร: ${phone || '-'}`,
-      '────────────',
-      'รายการ:',
-      itemLines.join('\n\n'),
-      '────────────',
-      `ค่าสินค้า: ${formatTHB_(itemsTotal)}`,
-      `ค่าส่ง: ${formatTHB_(shippingFee)}`,
-      `ยอดรวมสุทธิ: ${formatTHB_(grandTotal)}`,
-      '🙏 ขอบคุณที่สั่งซื้อกับเรา'
-    ].filter(Boolean).join('\n');
-
-    const payload = {
-      to: lineUserId,
-      messages: [{
-        type: 'text',
-        text
-      }]
-    };
-
-    const resp = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
-      method: 'post',
-      contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + token },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    });
-
-    const status = resp.getResponseCode();
-    const body = resp.getContentText();
-
-    return {
-      attempted: true,
-      ok: status >= 200 && status < 300,
-      status,
-      body
-    };
-  } catch (err) {
-    console.error('pushLineOrderConfirm_ failed', err);
-    return { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
-  }
-}
-
-function sendN8NWebhook_(url, payload) {
-  if (!url) return { attempted: false, ok: false, error: 'Missing N8N_WEBHOOK_URL' };
-  try {
-    const resp = UrlFetchApp.fetch(url, {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true
-    });
-    const status = resp.getResponseCode();
-    const body = resp.getContentText();
-    return { attempted: true, ok: status >= 200 && status < 300, status, body };
-  } catch (err) {
-    return { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
-  }
-}
-
-function pushAdminOrderAlert_(token, adminUserId, details) {
-  if (!token || !adminUserId) return { attempted: false, ok: false, error: 'Missing admin notify config' };
-  try {
-    const lines = Array.isArray(details.items) ? details.items : [];
-    const itemLines = lines.slice(0, 3).map((it, idx) => {
-      const namePart = `${it.Brand ? it.Brand + ' ' : ''}${it.Name || ''}`.trim();
-      return `${idx + 1}) ${namePart} x${it.qty} = ${formatTHB_(it.lineTotal)}`;
-    });
-    if (lines.length > 3) {
-      itemLines.push(`...อีก ${lines.length - 3} รายการ`);
-    }
-    const text = [
-      '[ADMIN] คำสั่งซื้อใหม่',
-      `Order: ${details.orderId}`,
-      `ลูกค้า: ${details.displayName || '-'} (${details.lineUserId || '-'})`,
-      ...itemLines,
-      `ค่าสินค้า: ${formatTHB_(details.itemsTotal)}`,
-      `ค่าส่ง: ${formatTHB_(details.shippingFee)}`,
-      `รวมสุทธิ: ${formatTHB_(details.grandTotal)}`
-    ].join('\n');
-
-    const resp = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
-      method: 'post',
-      contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + token },
-      payload: JSON.stringify({
-        to: adminUserId,
-        messages: [{ type: 'text', text }]
-      }),
-      muteHttpExceptions: true
-    });
-
-    const status = resp.getResponseCode();
-    const body = resp.getContentText();
-    return {
-      attempted: true,
-      ok: status >= 200 && status < 300,
-      status,
-      body
-    };
-  } catch (err) {
-    return { attempted: true, ok: false, error: String(err && err.message ? err.message : err) };
-  }
-}
-
-/** ====== ORDER ID GENERATION ====== */
 function getNextOrderId_() {
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
 
   try {
     const props = PropertiesService.getScriptProperties();
-    let last = Number(props.getProperty('LAST_ORDER_NO') || 0);
-
-    // ถ้ายังไม่เคยตั้ง ให้สแกนใน Orders หาเลขมากสุด
-    if (!last || last <= 0) {
-      last = scanMaxOrderNo_();
-    }
+    let last = toNumber_(props.getProperty('LAST_ORDER_NO'));
+    if (last <= 0) last = scanMaxOrderNo_();
 
     const next = last + 1;
     props.setProperty('LAST_ORDER_NO', String(next));
@@ -638,384 +643,565 @@ function getNextOrderId_() {
 }
 
 function scanMaxOrderNo_() {
-  const sh = getSheet_('Orders');
-  const map = getHeaderMap_(sh);
-  const cOrderId = map['OrderID'];
-  if (!cOrderId) return 0;
-
-  const lastRow = sh.getLastRow();
+  const { sheet, map } = assertHeaders_('Orders', ['OrderID']);
+  const lastRow = sheet.getLastRow();
   if (lastRow < 2) return 0;
 
-  const vals = sh.getRange(2, cOrderId, lastRow - 1, 1).getValues().flat();
-  let maxNo = 0;
-  for (const v of vals) {
-    const s = String(v || '');
-    const m = s.match(/^OD(\d+)$/);
-    if (m) {
-      const n = Number(m[1]);
-      if (n > maxNo) maxNo = n;
-    }
-  }
-  return maxNo;
+  const values = sheet.getRange(2, map.OrderID, lastRow - 1, 1).getDisplayValues().flat();
+  return values.reduce((max, value) => {
+    const match = text_(value).match(/^OD0*(\d+)$/i);
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, 0);
 }
 
-/** ====== CUSTOMER (optional but recommended) ====== */
-function handleMe_(body) {
-  const verified = verifyLineIdToken_(body.idToken);
-  const lineUserId = verified.sub;
-  const displayName = verified.name || '';
-  upsertCustomer_(lineUserId, displayName);
-  return { ok: true, lineUserId, displayName };
-}
+/* =========================
+ * CUSTOMER
+ * ========================= */
 
-function upsertCustomer_(lineUserId, displayName, address, phone, store, area) {
-  const sh = getSheet_('Customer');
-  const map = getHeaderMap_(sh);
-  const cUser = map['lineUserId'];
-  if (!cUser) return;
+function upsertCustomer_(profile) {
+  assert_(isRealLineUserId_(profile.lineUserId), 'Invalid LINE user ID');
 
-  const last = sh.getLastRow();
+  const { sheet, map } = assertHeaders_('Customer', ['lineUserId', 'customerId']);
+  const rowNumber = findRowByValue_(sheet, map.lineUserId, profile.lineUserId);
   const now = nowIso_();
 
-  // scan existing
-  if (last >= 2) {
-    const vals = sh.getRange(2, cUser, last - 1, 1).getValues();
-    for (let i = 0; i < vals.length; i++) {
-      if (String(vals[i][0] || '') === String(lineUserId)) {
-        // update displayName + lastSeenAt
-        if (map['displayName']) sh.getRange(i + 2, map['displayName']).setValue(displayName);
-        if (address && map['address']) sh.getRange(i + 2, map['address']).setValue(address);
-        if (address && map['defaultAddress']) sh.getRange(i + 2, map['defaultAddress']).setValue(address);
-        if (phone && map['phone']) sh.getRange(i + 2, map['phone']).setValue(phone);
-        if (store && map['store']) sh.getRange(i + 2, map['store']).setValue(store);
-        if (area && map['area']) sh.getRange(i + 2, map['area']).setValue(area);
-        if (map['lastSeenAt']) sh.getRange(i + 2, map['lastSeenAt']).setValue(now);
-        return;
-      }
-    }
+  const data = {
+    lineUserId: profile.lineUserId,
+    customerId: profile.lineUserId,
+    name: profile.displayName,
+    displayName: profile.displayName,
+    store: profile.store,
+    area: profile.area,
+    phone: normalisePhone_(profile.phone),
+    defaultAddress: profile.defaultAddress,
+    lastSeenAt: now,
+    status: 'ACTIVE'
+  };
+
+  if (rowNumber) {
+    updateObjectRow_(sheet, rowNumber, map, data);
+    return rowNumber;
   }
 
-  // insert new
-  const row = new Array(sh.getLastColumn()).fill('');
-  if (map['lineUserId']) row[map['lineUserId'] - 1] = lineUserId;
-  if (map['displayName']) row[map['displayName'] - 1] = displayName;
-  if (map['address']) row[map['address'] - 1] = address || '';
-  if (map['defaultAddress']) row[map['defaultAddress'] - 1] = address || '';
-  if (map['phone']) row[map['phone'] - 1] = phone || '';
-  if (map['store']) row[map['store'] - 1] = store || '';
-  if (map['area']) row[map['area'] - 1] = area || '';
-  if (map['createdAt']) row[map['createdAt'] - 1] = now;
-  if (map['lastSeenAt']) row[map['lastSeenAt'] - 1] = now;
-  sh.appendRow(row);
+  data.createdAt = now;
+  data.linkedAt = now;
+  const row = objectToRow_(sheet, map, data);
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  return sheet.getLastRow();
 }
 
-/** ====== FAVORITES ====== */
-function resolveFavoritesUser_(body) {
-  const providedId = String(body.lineUserId || '').trim();
-  if (body.idToken) {
-    try {
-      const verified = verifyLineIdToken_(body.idToken);
-      // Prefer explicit provided lineUserId (from LIFF profile) if present; otherwise use verified sub.
-      if (providedId) return providedId;
-      return verified.sub;
-    } catch (err) {
-      if (providedId) return providedId; // fallback if verify fails
-      throw err;
-    }
-  }
-  assert_(providedId, 'Missing user identity for favorites');
-  return providedId;
+function getCustomerProfile_(lineUserId) {
+  if (!isRealLineUserId_(lineUserId)) return emptyProfile_();
+
+  const { sheet, map } = assertHeaders_('Customer', ['lineUserId']);
+  const rowNumber = findRowByValue_(sheet, map.lineUserId, lineUserId);
+  if (!rowNumber) return emptyProfile_();
+
+  const row = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const value = header => map[header] ? row[map[header] - 1] : '';
+
+  return {
+    lineUserId,
+    customerId: text_(value('customerId')) || lineUserId,
+    displayName: text_(value('displayName') || value('name')),
+    store: text_(value('store')),
+    area: text_(value('area')),
+    phone: normalisePhone_(value('phone')),
+    defaultAddress: text_(value('defaultAddress')),
+    address: text_(value('defaultAddress'))
+  };
 }
+
+function emptyProfile_() {
+  return {
+    lineUserId: '',
+    customerId: '',
+    displayName: '',
+    store: '',
+    area: '',
+    phone: '',
+    defaultAddress: '',
+    address: ''
+  };
+}
+
+function normalisePhone_(value) {
+  const raw = text_(value);
+  if (!raw) return '';
+
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 9 && !digits.startsWith('0')) return '0' + digits;
+  return digits || raw;
+}
+
+function handleMe_(body) {
+  const identity = resolveIdentity_(body, { requireLine: true });
+
+  upsertCustomer_({
+    lineUserId: identity.lineUserId,
+    displayName: identity.displayName,
+    store: '',
+    area: '',
+    phone: '',
+    defaultAddress: ''
+  });
+
+  return {
+    ok: true,
+    lineUserId: identity.lineUserId,
+    customerId: identity.lineUserId,
+    displayName: identity.displayName,
+    profile: getCustomerProfile_(identity.lineUserId)
+  };
+}
+
+function handleCustomerProfileGet_(body) {
+  const identity = resolveIdentity_(body, { requireLine: true });
+  return {
+    ok: true,
+    lineUserId: identity.lineUserId,
+    profile: getCustomerProfile_(identity.lineUserId)
+  };
+}
+
+function handleCustomerProfileSet_(body) {
+  const identity = resolveIdentity_(body, { requireLine: true });
+
+  upsertCustomer_({
+    lineUserId: identity.lineUserId,
+    displayName: text_(body.displayName) || identity.displayName,
+    store: text_(body.store || body.storeName),
+    area: text_(body.area || body.soi),
+    phone: normalisePhone_(body.phone),
+    defaultAddress: text_(body.address || body.defaultAddress)
+  });
+
+  return {
+    ok: true,
+    lineUserId: identity.lineUserId,
+    customerId: identity.lineUserId,
+    profile: getCustomerProfile_(identity.lineUserId)
+  };
+}
+
+function handleCustomerSummary_(body) {
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const summary = calculateCustomerSummary_(identity.lineUserId);
+  return { ok: true, summary };
+}
+
+function calculateCustomerSummary_(lineUserId) {
+  const { sheet, map } = assertHeaders_('Orders', [
+    'OrderID',
+    'lineUserId',
+    'itemsTotal',
+    'shippingFee',
+    'grandTotal',
+    'status'
+  ]);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return {
+      customerId: lineUserId,
+      orderCount: 0,
+      productTotal: 0,
+      shippingTotal: 0,
+      lifetimeSpend: 0,
+      rewards: []
+    };
+  }
+
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  let orderCount = 0;
+  let productTotal = 0;
+  let shippingTotal = 0;
+  let lifetimeSpend = 0;
+
+  rows.forEach(row => {
+    if (text_(row[map.lineUserId - 1]) !== lineUserId) return;
+
+    const status = text_(row[map.status - 1]).toUpperCase();
+    if (['CANCELLED', 'CANCELED', 'VOID'].includes(status)) return;
+
+    orderCount += 1;
+    productTotal += toNumber_(row[map.itemsTotal - 1]);
+    shippingTotal += toNumber_(row[map.shippingFee - 1]);
+    lifetimeSpend += toNumber_(row[map.grandTotal - 1]);
+  });
+
+  return {
+    customerId: lineUserId,
+    orderCount,
+    productTotal,
+    shippingTotal,
+    lifetimeSpend,
+    rewards: getEligibleRewards_(lifetimeSpend)
+  };
+}
+
+function getEligibleRewards_(lifetimeSpend) {
+  const sheet = openDb_().getSheetByName('Rewards');
+  if (!sheet || sheet.getLastRow() < 2) return [];
+
+  const map = getHeaderMap_(sheet);
+  if (!map.RewardID || !map.RewardName) return [];
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const now = new Date();
+
+  return rows
+    .map(row => {
+      const value = header => map[header] ? row[map[header] - 1] : '';
+      const active = value('Active');
+      const startDate = value('StartDate');
+      const endDate = value('EndDate');
+      const requiredSpend = toNumber_(value('RequiredSpend'));
+
+      if (!(active === true || text_(active).toLowerCase() === 'true')) return null;
+      if (startDate && new Date(startDate) > now) return null;
+      if (endDate && new Date(endDate) < now) return null;
+      if (requiredSpend > lifetimeSpend) return null;
+
+      return {
+        rewardId: text_(value('RewardID')),
+        rewardName: text_(value('RewardName')),
+        requiredSpend,
+        rewardType: text_(value('RewardType')),
+        rewardValue: value('RewardValue'),
+        note: text_(value('Note'))
+      };
+    })
+    .filter(Boolean);
+}
+
+/* =========================
+ * FAVORITES
+ * ========================= */
 
 function handleFavoritesGet_(body) {
-  const lineUserId = resolveFavoritesUser_(body);
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const { sheet, map } = assertHeaders_('Favorites', ['lineUserId', 'Brand', 'Name']);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { ok: true, favorites: [] };
 
-  const sh = getSheet_('Favorites');
-  const map = getHeaderMap_(sh);
+  const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  const favorites = rows
+    .filter(row => text_(row[map.lineUserId - 1]) === identity.lineUserId)
+    .map(row => ({
+      SKU: map.SKU ? text_(row[map.SKU - 1]) : '',
+      Brand: text_(row[map.Brand - 1]),
+      Size: map.Size ? text_(row[map.Size - 1]) : '',
+      Name: text_(row[map.Name - 1])
+    }));
 
-  const cUser = map['lineUserId'];
-  assert_(cUser, 'Favorites sheet missing lineUserId');
-
-  const last = sh.getLastRow();
-  if (last < 2) return { ok: true, favorites: [] };
-
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-  const out = [];
-  for (const r of values) {
-    if (String(r[cUser - 1] || '') !== String(lineUserId)) continue;
-    out.push({
-      SKU: map['SKU'] ? (r[map['SKU'] - 1] || '') : '',
-      Brand: map['Brand'] ? (r[map['Brand'] - 1] || '') : '',
-      Size: map['Size'] ? (r[map['Size'] - 1] || '') : '',
-      Name: map['Name'] ? (r[map['Name'] - 1] || '') : ''
-    });
-  }
-  return { ok: true, favorites: out };
+  return { ok: true, favorites };
 }
 
 function handleFavoritesAdd_(body) {
-  const lineUserId = resolveFavoritesUser_(body);
-
+  const identity = resolveIdentity_(body, { requireLine: true });
   const item = body.item || {};
-  const Brand = String(item.Brand || '').trim();
-  const Size = String(item.Size || '').trim();
-  const Name = String(item.Name || '').trim();
-  assert_(Brand && Name, 'Invalid favorite item');
+  const brand = text_(item.Brand || item.brand);
+  const size = text_(item.Size || item.size);
+  const name = text_(item.Name || item.name);
+  assert_(brand && name, 'Invalid favorite item');
 
-  const sh = getSheet_('Favorites');
-  const map = getHeaderMap_(sh);
-  const now = nowIso_();
+  const { sheet, map } = assertHeaders_('Favorites', ['lineUserId', 'Brand', 'Name']);
+  const lastRow = sheet.getLastRow();
 
-  // prevent duplicates
-  const last = sh.getLastRow();
-  if (last >= 2) {
-    const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-    for (let i = 0; i < values.length; i++) {
-      const r = values[i];
-      if (String(r[map['lineUserId'] - 1] || '') === String(lineUserId) &&
-          String(r[map['Brand'] - 1] || '') === Brand &&
-          String(r[map['Size'] - 1] || '') === Size &&
-          String(r[map['Name'] - 1] || '') === Name) {
-        // update updatedAt
-        if (map['updatedAt']) sh.getRange(i + 2, map['updatedAt']).setValue(now);
-        return { ok: true };
+  if (lastRow >= 2) {
+    const rows = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      if (
+        text_(row[map.lineUserId - 1]) === identity.lineUserId &&
+        text_(row[map.Brand - 1]) === brand &&
+        (!map.Size || text_(row[map.Size - 1]) === size) &&
+        text_(row[map.Name - 1]) === name
+      ) {
+        if (map.updatedAt) sheet.getRange(index + 2, map.updatedAt).setValue(nowIso_());
+        return { ok: true, duplicate: true };
       }
     }
   }
 
-  const row = new Array(sh.getLastColumn()).fill('');
-  if (map['lineUserId']) row[map['lineUserId'] - 1] = lineUserId;
-  if (map['SKU']) row[map['SKU'] - 1] = String(item.SKU || '');
-  if (map['Brand']) row[map['Brand'] - 1] = Brand;
-  if (map['Size']) row[map['Size'] - 1] = Size;
-  if (map['Name']) row[map['Name'] - 1] = Name;
-  if (map['createdAt']) row[map['createdAt'] - 1] = now;
-  if (map['updatedAt']) row[map['updatedAt'] - 1] = now;
-  sh.appendRow(row);
+  const now = nowIso_();
+  appendObjectRow_('Favorites', {
+    lineUserId: identity.lineUserId,
+    SKU: text_(item.SKU || item.id),
+    Brand: brand,
+    Size: size,
+    Name: name,
+    createdAt: now,
+    updatedAt: now
+  }, ZIPDAM_SCHEMA.Favorites);
 
   return { ok: true };
 }
 
 function handleFavoritesRemove_(body) {
-  const lineUserId = resolveFavoritesUser_(body);
-
+  const identity = resolveIdentity_(body, { requireLine: true });
   const item = body.item || {};
-  const Brand = String(item.Brand || '').trim();
-  const Size = String(item.Size || '').trim();
-  const Name = String(item.Name || '').trim();
-  assert_(Brand && Name, 'Invalid favorite item');
+  const brand = text_(item.Brand || item.brand);
+  const size = text_(item.Size || item.size);
+  const name = text_(item.Name || item.name);
+  assert_(brand && name, 'Invalid favorite item');
 
-  const sh = getSheet_('Favorites');
-  const map = getHeaderMap_(sh);
+  const { sheet, map } = assertHeaders_('Favorites', ['lineUserId', 'Brand', 'Name']);
+  if (sheet.getLastRow() < 2) return { ok: true, removed: 0 };
 
-  const last = sh.getLastRow();
-  if (last < 2) return { ok: true };
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  let removed = 0;
 
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-  for (let i = values.length - 1; i >= 0; i--) {
-    const r = values[i];
-    if (String(r[map['lineUserId'] - 1] || '') === String(lineUserId) &&
-        String(r[map['Brand'] - 1] || '') === Brand &&
-        String(r[map['Size'] - 1] || '') === Size &&
-        String(r[map['Name'] - 1] || '') === Name) {
-      sh.deleteRow(i + 2);
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (
+      text_(row[map.lineUserId - 1]) === identity.lineUserId &&
+      text_(row[map.Brand - 1]) === brand &&
+      (!map.Size || text_(row[map.Size - 1]) === size) &&
+      text_(row[map.Name - 1]) === name
+    ) {
+      sheet.deleteRow(index + 2);
+      removed += 1;
     }
   }
-  return { ok: true };
+
+  return { ok: true, removed };
 }
 
-/** ====== TEMPLATES ====== */
+/* =========================
+ * TEMPLATES
+ * ========================= */
+
 function handleTemplatesGet_(body) {
-  const verified = verifyLineIdToken_(body.idToken);
-  const lineUserId = verified.sub;
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const { sheet, map } = assertHeaders_('Templates', ['templateId', 'lineUserId', 'templateName', 'itemsJson']);
+  if (sheet.getLastRow() < 2) return { ok: true, templates: [] };
 
-  const sh = getSheet_('Templates');
-  const map = getHeaderMap_(sh);
-  const last = sh.getLastRow();
-  if (last < 2) return { ok: true, templates: [] };
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  const templates = rows
+    .filter(row => text_(row[map.lineUserId - 1]) === identity.lineUserId)
+    .map(row => {
+      let items = [];
+      try { items = JSON.parse(text_(row[map.itemsJson - 1]) || '[]'); } catch (_) {}
 
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-  const out = [];
-  for (const r of values) {
-    if (String(r[map['lineUserId'] - 1] || '') !== String(lineUserId)) continue;
-    const itemsJson = map['itemsJson'] ? String(r[map['itemsJson'] - 1] || '[]') : '[]';
-    let items = [];
-    try { items = JSON.parse(itemsJson); } catch (_) {}
-    out.push({
-      templateId: map['templateId'] ? (r[map['templateId'] - 1] || '') : '',
-      templateName: map['templateName'] ? (r[map['templateName'] - 1] || '') : '',
-      items,
-      lastUsedAt: map['lastUsedAt'] ? (r[map['lastUsedAt'] - 1] || '') : ''
+      return {
+        templateId: text_(row[map.templateId - 1]),
+        templateName: text_(row[map.templateName - 1]),
+        items,
+        lastUsedAt: map.lastUsedAt ? row[map.lastUsedAt - 1] : ''
+      };
     });
-  }
-  return { ok: true, templates: out };
+
+  return { ok: true, templates };
 }
 
 function handleTemplatesAdd_(body) {
-  const verified = verifyLineIdToken_(body.idToken);
-  const lineUserId = verified.sub;
-
-  const templateName = String(body.templateName || '').trim();
-  const items = body.items;
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const templateName = text_(body.templateName);
+  const items = Array.isArray(body.items) ? body.items : [];
   assert_(templateName, 'templateName required');
-  assert_(Array.isArray(items) && items.length > 0, 'items required');
+  assert_(items.length > 0, 'items required');
 
-  const sh = getSheet_('Templates');
-  const map = getHeaderMap_(sh);
   const now = nowIso_();
+  const templateId = generateSequentialId_('LAST_TEMPLATE_NO', 'TMP', 4);
 
-  const templateId = generateTemplateId_();
-
-  const row = new Array(sh.getLastColumn()).fill('');
-  if (map['templateId']) row[map['templateId'] - 1] = templateId;
-  if (map['lineUserId']) row[map['lineUserId'] - 1] = lineUserId;
-  if (map['templateName']) row[map['templateName'] - 1] = templateName;
-  if (map['itemsJson']) row[map['itemsJson'] - 1] = JSON.stringify(items);
-  if (map['createdAt']) row[map['createdAt'] - 1] = now;
-  if (map['updatedAt']) row[map['updatedAt'] - 1] = now;
-  if (map['lastUsedAt']) row[map['lastUsedAt'] - 1] = '';
-  sh.appendRow(row);
+  appendObjectRow_('Templates', {
+    templateId,
+    lineUserId: identity.lineUserId,
+    templateName,
+    itemsJson: JSON.stringify(items),
+    createdAt: now,
+    updatedAt: now,
+    lastUsedAt: '',
+    note: text_(body.note)
+  }, ZIPDAM_SCHEMA.Templates);
 
   return { ok: true, templateId };
 }
 
 function handleTemplatesDelete_(body) {
-  const verified = verifyLineIdToken_(body.idToken);
-  const lineUserId = verified.sub;
-
-  const templateId = String(body.templateId || '').trim();
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const templateId = text_(body.templateId);
   assert_(templateId, 'templateId required');
 
-  const sh = getSheet_('Templates');
-  const map = getHeaderMap_(sh);
-  const last = sh.getLastRow();
-  if (last < 2) return { ok: true };
+  const { sheet, map } = assertHeaders_('Templates', ['templateId', 'lineUserId']);
+  if (sheet.getLastRow() < 2) return { ok: true, removed: 0 };
 
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-  for (let i = values.length - 1; i >= 0; i--) {
-    const r = values[i];
-    if (String(r[map['lineUserId'] - 1] || '') === String(lineUserId) &&
-        String(r[map['templateId'] - 1] || '') === templateId) {
-      sh.deleteRow(i + 2);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+  let removed = 0;
+
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (
+      text_(row[map.lineUserId - 1]) === identity.lineUserId &&
+      text_(row[map.templateId - 1]) === templateId
+    ) {
+      sheet.deleteRow(index + 2);
+      removed += 1;
     }
   }
-  return { ok: true };
+
+  return { ok: true, removed };
 }
 
-function generateTemplateId_() {
+function generateSequentialId_(propertyKey, prefix, width) {
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
+
   try {
     const props = PropertiesService.getScriptProperties();
-    let last = Number(props.getProperty('LAST_TEMPLATE_NO') || 0);
-    const next = last + 1;
-    props.setProperty('LAST_TEMPLATE_NO', String(next));
-    return 'TMP' + String(next).padStart(4, '0');
+    const next = toNumber_(props.getProperty(propertyKey)) + 1;
+    props.setProperty(propertyKey, String(next));
+    return prefix + String(next).padStart(width, '0');
   } finally {
     lock.releaseLock();
   }
 }
 
-/** ====== FREQUENT (compute from OrderItems) ====== */
+/* =========================
+ * FREQUENT ITEMS
+ * ========================= */
+
 function handleFrequentGet_(body) {
-  const verified = verifyLineIdToken_(body.idToken);
-  const lineUserId = verified.sub;
-  const limit = Math.max(1, Math.min(20, Number(body.limit || 6)));
+  const identity = resolveIdentity_(body, { requireLine: true });
+  const limit = Math.max(1, Math.min(20, Math.floor(toNumber_(body.limit) || 6)));
 
-  // ต้องรู้ว่าออเดอร์ไหนเป็นของ user นี้: จาก Orders (lineUserId) -> list OrderID
-  const ordersSh = getSheet_('Orders');
-  const oMap = getHeaderMap_(ordersSh);
-  const cUser = oMap['lineUserId'];
-  const cOrder = oMap['OrderID'];
-  assert_(cUser && cOrder, 'Orders sheet missing lineUserId/OrderID');
+  const { sheet: ordersSheet, map: ordersMap } = assertHeaders_('Orders', ['OrderID', 'lineUserId']);
+  if (ordersSheet.getLastRow() < 2) return { ok: true, frequent: [] };
 
-  const lastO = ordersSh.getLastRow();
-  if (lastO < 2) return { ok: true, frequent: [] };
+  const orderRows = ordersSheet
+    .getRange(2, 1, ordersSheet.getLastRow() - 1, ordersSheet.getLastColumn())
+    .getValues();
 
-  const oValues = ordersSh.getRange(2, 1, lastO - 1, ordersSh.getLastColumn()).getValues();
-  const orderIds = new Set();
-  for (const r of oValues) {
-    if (String(r[cUser - 1] || '') === String(lineUserId)) {
-      orderIds.add(String(r[cOrder - 1] || ''));
-    }
-  }
-  if (orderIds.size === 0) return { ok: true, frequent: [] };
+  const orderIds = new Set(
+    orderRows
+      .filter(row => text_(row[ordersMap.lineUserId - 1]) === identity.lineUserId)
+      .map(row => text_(row[ordersMap.OrderID - 1]))
+      .filter(Boolean)
+  );
 
-  const itemSh = getSheet_('OrderItems');
-  const iMap = getHeaderMap_(itemSh);
-  const iOrder = iMap['OrderID'];
-  const iBrand = iMap['Brand'];
-  const iSize = iMap['Size'];
-  const iName = iMap['Name'];
-  const iQty = iMap['qty'];
-  assert_(iOrder && iBrand && iName && iQty, 'OrderItems missing columns');
+  if (!orderIds.size) return { ok: true, frequent: [] };
 
-  const lastI = itemSh.getLastRow();
-  if (lastI < 2) return { ok: true, frequent: [] };
+  const { sheet: itemsSheet, map: itemsMap } = assertHeaders_(
+    'OrderItems',
+    ['OrderID', 'Brand', 'Name', 'qty']
+  );
 
-  const iValues = itemSh.getRange(2, 1, lastI - 1, itemSh.getLastColumn()).getValues();
-  const counter = new Map(); // key -> {Brand,Size,Name,count}
-  for (const r of iValues) {
-    const oid = String(r[iOrder - 1] || '');
-    if (!orderIds.has(oid)) continue;
+  if (itemsSheet.getLastRow() < 2) return { ok: true, frequent: [] };
 
-    const Brand = String(r[iBrand - 1] || '');
-    const Size = iSize ? String(r[iSize - 1] || '') : '';
-    const Name = String(r[iName - 1] || '');
-    const qty = Number(r[iQty - 1] || 0);
+  const rows = itemsSheet
+    .getRange(2, 1, itemsSheet.getLastRow() - 1, itemsSheet.getLastColumn())
+    .getValues();
 
-    const key = `${Brand}||${Size}||${Name}`;
-    const cur = counter.get(key) || { Brand, Size, Name, count: 0 };
-    cur.count += qty;
-    counter.set(key, cur);
-  }
+  const counter = new Map();
 
-  const sorted = Array.from(counter.values()).sort((a, b) => b.count - a.count).slice(0, limit);
-  return { ok: true, frequent: sorted };
+  rows.forEach(row => {
+    const orderId = text_(row[itemsMap.OrderID - 1]);
+    if (!orderIds.has(orderId)) return;
+
+    const brand = text_(row[itemsMap.Brand - 1]);
+    const size = itemsMap.Size ? text_(row[itemsMap.Size - 1]) : '';
+    const name = text_(row[itemsMap.Name - 1]);
+    const quantity = toNumber_(row[itemsMap.qty - 1]);
+    const key = productKey_(brand, size, name);
+
+    const current = counter.get(key) || { Brand: brand, Size: size, Name: name, count: 0 };
+    current.count += quantity;
+    counter.set(key, current);
+  });
+
+  const frequent = Array.from(counter.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+
+  return { ok: true, frequent };
 }
 
-function handleCustomerProfileGet_(body) {
-  // similar to favorites: allow provided lineUserId fallback
-  const lineUserId = resolveFavoritesUser_(body);
-  const profile = getCustomerProfile_(lineUserId);
-  return { ok: true, profile };
-}
+/* =========================
+ * NOTIFICATIONS
+ * ========================= */
 
-function handleCustomerProfileSet_(body) {
-  // allow save by provided lineUserId, with idToken verification when available
-  const lineUserId = resolveFavoritesUser_(body);
-  const displayName = String(body.displayName || '').trim();
-  const store = String(body.store || body.storeName || '').trim();
-  const area = String(body.area || body.soi || '').trim();
-  const address = String(body.address || body.defaultAddress || '').trim();
-  const phone = String(body.phone || '').trim();
+function safePushOrderConfirmation_(
+  token,
+  lineUserId,
+  orderId,
+  items,
+  itemsTotal,
+  shippingFee,
+  grandTotal,
+  displayName,
+  address,
+  phone
+) {
+  if (!token) return { attempted: false, ok: false, error: 'LINE_MESSAGING_TOKEN is not configured' };
+  if (!isRealLineUserId_(lineUserId)) return { attempted: false, ok: false, error: 'Invalid LINE user ID' };
 
-  upsertCustomer_(lineUserId, displayName, address, phone, store, area);
-  const profile = getCustomerProfile_(lineUserId);
-  return { ok: true, lineUserId, profile };
-}
+  try {
+    const itemText = items.map((item, index) => [
+      `${index + 1}) ${item.Name}${item.Size ? ' ' + item.Size : ''}${item.pack ? ` (${item.pack}ชิ้น)` : ''}`,
+      `   จำนวน ${item.qty} กล่อง`,
+      `   ราคากล่องละ ${formatTHB_(item.unitPrice)}`,
+      `   รวม ${formatTHB_(item.lineTotal)}`
+    ].join('\n')).join('\n\n');
 
-function getCustomerProfile_(lineUserId) {
-  const sh = getSheet_('Customer');
-  const map = getHeaderMap_(sh);
-  const cUser = map['lineUserId'];
-  if (!cUser) return { address: '', defaultAddress: '', phone: '', store: '', area: '' };
+    const message = [
+      '🧾 ยืนยันคำสั่งซื้อ ZIPDAM',
+      `Order: ${orderId}`,
+      `ลูกค้า: ${displayName || '-'}`,
+      `ที่อยู่: ${address || '-'}`,
+      `โทร: ${phone || '-'}`,
+      '────────────',
+      itemText,
+      '────────────',
+      `ค่าสินค้า: ${formatTHB_(itemsTotal)}`,
+      `ค่าส่ง: ${formatTHB_(shippingFee)}`,
+      `ยอดรวมสุทธิ: ${formatTHB_(grandTotal)}`,
+      '🙏 ขอบคุณที่สั่งซื้อกับเรา'
+    ].join('\n');
 
-  const last = sh.getLastRow();
-  if (last < 2) return { address: '', defaultAddress: '', phone: '', store: '', area: '' };
+    const response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + token },
+      payload: JSON.stringify({
+        to: lineUserId,
+        messages: [{ type: 'text', text: message }]
+      }),
+      muteHttpExceptions: true
+    });
 
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-  for (let i = 0; i < values.length; i++) {
-    const r = values[i];
-    if (String(r[cUser - 1] || '') === String(lineUserId)) {
-      return {
-        address: map['address'] ? String(r[map['address'] - 1] || '') : '',
-        defaultAddress: map['defaultAddress'] ? String(r[map['defaultAddress'] - 1] || '') : '',
-        phone: map['phone'] ? String(r[map['phone'] - 1] || '') : '',
-        store: map['store'] ? String(r[map['store'] - 1] || '') : '',
-        area: map['area'] ? String(r[map['area'] - 1] || '') : ''
-      };
-    }
+    const status = response.getResponseCode();
+    return {
+      attempted: true,
+      ok: status >= 200 && status < 300,
+      status,
+      body: response.getContentText()
+    };
+  } catch (err) {
+    return { attempted: true, ok: false, error: errorMessage_(err) };
   }
-  return { address: '', defaultAddress: '', phone: '', store: '', area: '' };
+}
+
+function sendN8NWebhook_(url, payload) {
+  if (!url) return { attempted: false, ok: false, error: 'N8N_WEBHOOK_URL is not configured' };
+
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+
+    const status = response.getResponseCode();
+    return {
+      attempted: true,
+      ok: status >= 200 && status < 300,
+      status,
+      body: response.getContentText()
+    };
+  } catch (err) {
+    return { attempted: true, ok: false, error: errorMessage_(err) };
+  }
 }
