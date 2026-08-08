@@ -1215,8 +1215,43 @@ function calculateCustomerSummary_(lineUserId) {
     productTotal,
     shippingTotal,
     lifetimeSpend,
-    rewards: getEligibleRewards_(productTotal)
+    rewards: getEligibleRewards_(productTotal),
+    loyalty: safeLoyaltyProgress_(lineUserId)
   };
+}
+
+/**
+ * Same progress figures the order Flex card shows, but read-only: it never
+ * grants a cycle, so the app can display progress at any time.
+ */
+function safeLoyaltyProgress_(lineUserId) {
+  try {
+    const reward = getActiveSpendReward_();
+    if (!reward) return { eligible: false, reason: 'No active spend reward' };
+
+    const totalSpend = calculateEligibleProductSpend_(lineUserId);
+    const achievedCycles = Math.floor(totalSpend / reward.requiredSpend);
+    const cycleSpend = totalSpend % reward.requiredSpend;
+
+    return {
+      eligible: true,
+      rewardId: reward.rewardId,
+      rewardName: reward.rewardName,
+      rewardValue: reward.rewardValue,
+      totalSpend,
+      targetSpend: reward.requiredSpend,
+      cycleSpend,
+      remainingSpend: Math.max(0, reward.requiredSpend - cycleSpend),
+      progressPercent: Math.min(
+        100,
+        Math.round((cycleSpend / reward.requiredSpend) * 100)
+      ),
+      achievedCycles,
+      nextCycle: achievedCycles + 1
+    };
+  } catch (err) {
+    return { eligible: false, error: errorMessage_(err) };
+  }
 }
 
 function getEligibleRewards_(lifetimeSpend) {
