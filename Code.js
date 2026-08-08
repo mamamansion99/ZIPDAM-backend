@@ -662,7 +662,10 @@ function createOrder_(body, identity, options) {
     identity.displayName,
     address,
     phone,
-    loyalty
+    loyalty,
+    // An admin ordering for themselves gets no separate adminPush, so attach
+    // the summary text here to keep the owner notification complete.
+    { includeSummaryText: isAdminLineUserId_(identity.lineUserId) }
   );
 
   const adminNotificationLineUserId = text_(settings.adminNotificationLineUserId);

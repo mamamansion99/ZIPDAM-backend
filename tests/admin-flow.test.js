@@ -280,4 +280,49 @@ assert.equal(writtenOrder.customerId, MANUAL_ID);
 assert.equal(writtenOrder.loyaltyStatus, "EXCLUDED");
 assert.equal(manualUpdated.customerId, MANUAL_ID);
 
+// Notification routing: who gets the old-style summary text alongside the flex card
+let pushCalls = [];
+context.safePushOrderConfirmation_ = (_token, lineUserId, ...rest) => {
+  pushCalls.push({ lineUserId, options: rest[rest.length - 1] });
+  return { attempted: true, ok: true };
+};
+
+const runOrderFor = (customerLineUserId) => {
+  pushCalls = [];
+  vm.runInContext(
+    `createOrder_(
+      { cart: [{ SKU: "SKU-1", qty: 1 }] },
+      {
+        lineUserId: "${customerLineUserId}",
+        customerId: "${customerLineUserId}",
+        displayName: "Customer",
+        tokenVerified: true,
+        tokenError: "",
+        isGuest: false
+      },
+      {
+        createdByLineUserId: "${customerLineUserId}",
+        orderMode: "SELF",
+        adminNotificationLineUserId: "${ADMIN_ID}"
+      }
+    )`,
+    context,
+  );
+  return pushCalls;
+};
+
+// Regular customer: plain flex card, owner gets flex + summary text
+const customerOrderPushes = runOrderFor(CUSTOMER_ID);
+assert.equal(customerOrderPushes.length, 2);
+assert.equal(customerOrderPushes[0].lineUserId, CUSTOMER_ID);
+assert.equal(customerOrderPushes[0].options.includeSummaryText, false);
+assert.equal(customerOrderPushes[1].lineUserId, ADMIN_ID);
+assert.equal(customerOrderPushes[1].options.includeSummaryText, true);
+
+// Owner ordering for themselves: one push only, still carrying the summary text
+const ownerOrderPushes = runOrderFor(ADMIN_ID);
+assert.equal(ownerOrderPushes.length, 1);
+assert.equal(ownerOrderPushes[0].lineUserId, ADMIN_ID);
+assert.equal(ownerOrderPushes[0].options.includeSummaryText, true);
+
 console.log("admin flow tests passed");
