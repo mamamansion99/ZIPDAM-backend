@@ -98,8 +98,41 @@ const pushResult = context.safePushOrderConfirmation_(
   loyalty,
 );
 assert.equal(pushResult.ok, true);
+assert.equal(pushedPayload.messages.length, 1);
 assert.equal(pushedPayload.messages[0].type, "flex");
 assert.equal(pushedPayload.messages[0].contents.type, "bubble");
+
+// Owner push: flex card + old-style summary text
+const ownerPushResult = context.safePushOrderConfirmation_(
+  "token",
+  `U${"c".repeat(32)}`,
+  order.orderId,
+  order.items,
+  order.itemsTotal,
+  order.shippingFee,
+  order.grandTotal,
+  order.displayName,
+  order.address,
+  order.phone,
+  loyalty,
+  { includeSummaryText: true },
+);
+assert.equal(ownerPushResult.ok, true);
+assert.equal(pushedPayload.messages.length, 2);
+assert.equal(pushedPayload.messages[0].type, "flex");
+assert.equal(pushedPayload.messages[1].type, "text");
+
+const summaryText = pushedPayload.messages[1].text;
+assert.match(summaryText, /🧾 ยืนยันคำสั่งซื้อ ZIPDAM/);
+assert.match(summaryText, /Order: OD0054/);
+assert.match(summaryText, /ลูกค้า: ZIPDAM Customer/);
+assert.match(summaryText, /ที่อยู่: Bangkok/);
+assert.match(summaryText, /โทร: 0812345678/);
+assert.match(summaryText, /1\) Durex Airy 52 mm/);
+assert.match(summaryText, /จำนวน 2 กล่อง/);
+assert.match(summaryText, /ค่าสินค้า: ฿650/);
+assert.match(summaryText, /ค่าส่ง: ฿20/);
+assert.match(summaryText, /ยอดรวมสุทธิ: ฿670/);
 
 context.getActiveSpendReward_ = () => ({
   rewardId: "GIFT-10000",

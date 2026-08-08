@@ -680,7 +680,8 @@ function createOrder_(body, identity, options) {
         identity.displayName,
         address,
         phone,
-        loyalty
+        loyalty,
+        { includeSummaryText: true }
       )
     : { attempted: false, ok: false };
 
@@ -1712,13 +1713,16 @@ function safePushOrderConfirmation_(
   displayName,
   address,
   phone,
-  loyalty
+  loyalty,
+  options
 ) {
   if (!token) return { attempted: false, ok: false, error: 'LINE_MESSAGING_TOKEN is not configured' };
   if (!isRealLineUserId_(lineUserId)) return { attempted: false, ok: false, error: 'Invalid LINE user ID' };
 
+  const settings = Object.assign({ includeSummaryText: false }, options || {});
+
   try {
-    const message = buildOrderConfirmationFlex_({
+    const order = {
       orderId,
       items,
       itemsTotal,
@@ -1728,7 +1732,12 @@ function safePushOrderConfirmation_(
       address,
       phone,
       loyalty
-    });
+    };
+
+    const messages = [buildOrderConfirmationFlex_(order)];
+    if (settings.includeSummaryText) {
+      messages.push({ type: 'text', text: buildOrderSummaryText_(order) });
+    }
 
     const response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
       method: 'post',
@@ -1736,7 +1745,7 @@ function safePushOrderConfirmation_(
       headers: { Authorization: 'Bearer ' + token },
       payload: JSON.stringify({
         to: lineUserId,
-        messages: [message]
+        messages
       }),
       muteHttpExceptions: true
     });
@@ -1751,6 +1760,31 @@ function safePushOrderConfirmation_(
   } catch (err) {
     return { attempted: true, ok: false, error: errorMessage_(err) };
   }
+}
+
+function buildOrderSummaryText_(order) {
+  const items = Array.isArray(order.items) ? order.items : [];
+  const itemText = items.map((item, index) => [
+    `${index + 1}) ${text_(item.Name)}${item.Size ? ' ' + text_(item.Size) : ''}${item.pack ? ` (${item.pack}ชิ้น)` : ''}`,
+    `   จำนวน ${toNumber_(item.qty)} กล่อง`,
+    `   ราคากล่องละ ${formatTHB_(item.unitPrice)}`,
+    `   รวม ${formatTHB_(item.lineTotal)}`
+  ].join('\n')).join('\n\n');
+
+  return [
+    '🧾 ยืนยันคำสั่งซื้อ ZIPDAM',
+    `Order: ${text_(order.orderId)}`,
+    `ลูกค้า: ${text_(order.displayName) || '-'}`,
+    `ที่อยู่: ${text_(order.address) || '-'}`,
+    `โทร: ${text_(order.phone) || '-'}`,
+    '────────────',
+    itemText,
+    '────────────',
+    `ค่าสินค้า: ${formatTHB_(order.itemsTotal)}`,
+    `ค่าส่ง: ${formatTHB_(order.shippingFee)}`,
+    `ยอดรวมสุทธิ: ${formatTHB_(order.grandTotal)}`,
+    '🙏 ขอบคุณที่สั่งซื้อกับเรา'
+  ].join('\n');
 }
 
 function buildOrderConfirmationFlex_(order) {
