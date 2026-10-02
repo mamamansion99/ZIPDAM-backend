@@ -87,7 +87,9 @@ function json_(obj) {
 function doGet(e) {
   try {
     const action = String(e?.parameter?.action || '');
-    if (action === 'catalog') return json_({ ok: true, catalog: getCatalog_() });
+    if (action === 'catalog') {
+      return json_({ ok: true, catalog: getCatalog_(), bestSellers: safeBestSellers_() });
+    }
     if (action === 'health') return json_(getHealth_());
     return json_({ ok: false, error: 'Unknown GET action. Use catalog or health.' });
   } catch (err) {
@@ -1684,29 +1686,36 @@ function generateSequentialId_(propertyKey, prefix, width) {
 function handleFrequentGet_(body) {
   const identity = resolveIdentity_(body, { requireLine: true });
   const limit = Math.max(1, Math.min(20, Math.floor(toNumber_(body.limit) || 6)));
+  const empty = { ok: true, frequent: [], lastOrder: null };
 
   const { sheet: ordersSheet, map: ordersMap } = assertHeaders_('Orders', ['OrderID', 'lineUserId']);
-  if (ordersSheet.getLastRow() < 2) return { ok: true, frequent: [] };
+  if (ordersSheet.getLastRow() < 2) return empty;
 
   const orderRows = ordersSheet
     .getRange(2, 1, ordersSheet.getLastRow() - 1, ordersSheet.getLastColumn())
     .getValues();
 
+  const customerOrders = orderRows
+    .filter(row => text_(row[ordersMap.lineUserId - 1]) === identity.lineUserId)
+    .filter(row => !ordersMap.status || !isCancelledStatus_(row[ordersMap.status - 1]));
   const orderIds = new Set(
-    orderRows
-      .filter(row => text_(row[ordersMap.lineUserId - 1]) === identity.lineUserId)
+    customerOrders
       .map(row => text_(row[ordersMap.OrderID - 1]))
       .filter(Boolean)
   );
 
-  if (!orderIds.size) return { ok: true, frequent: [] };
+  if (!orderIds.size) return empty;
+
+  const lastOrderRow = findLastOrderRow_(customerOrders, ordersMap);
+  const lastOrderId = lastOrderRow ? text_(lastOrderRow[ordersMap.OrderID - 1]) : '';
+  const lastOrderItems = [];
 
   const { sheet: itemsSheet, map: itemsMap } = assertHeaders_(
     'OrderItems',
     ['OrderID', 'Brand', 'Name', 'qty']
   );
 
-  if (itemsSheet.getLastRow() < 2) return { ok: true, frequent: [] };
+  if (itemsSheet.getLastRow() < 2) return empty;
 
   const rows = itemsSheet
     .getRange(2, 1, itemsSheet.getLastRow() - 1, itemsSheet.getLastColumn())
@@ -1718,22 +1727,163 @@ function handleFrequentGet_(body) {
     const orderId = text_(row[itemsMap.OrderID - 1]);
     if (!orderIds.has(orderId)) return;
 
+    // Size is Big/Small/Gel here but millimetres in the storefront, so the
+    // SKU is what lets the app match these rows back to a product.
+    const sku = itemsMap.SKU ? text_(row[itemsMap.SKU - 1]) : '';
     const brand = text_(row[itemsMap.Brand - 1]);
     const size = itemsMap.Size ? text_(row[itemsMap.Size - 1]) : '';
     const name = text_(row[itemsMap.Name - 1]);
     const quantity = toNumber_(row[itemsMap.qty - 1]);
     const key = productKey_(brand, size, name);
 
-    const current = counter.get(key) || { Brand: brand, Size: size, Name: name, count: 0 };
+    const current = counter.get(key) || { SKU: sku, Brand: brand, Size: size, Name: name, count: 0 };
+    if (!current.SKU && sku) current.SKU = sku;
     current.count += quantity;
     counter.set(key, current);
+
+    if (orderId === lastOrderId && quantity > 0) {
+      lastOrderItems.push({ SKU: sku, Brand: brand, Size: size, Name: name, qty: quantity });
+    }
   });
 
   const frequent = Array.from(counter.values())
     .sort((a, b) => b.count - a.count)
     .slice(0, limit);
 
-  return { ok: true, frequent };
+  const lastOrder = lastOrderItems.length
+    ? {
+      orderId: lastOrderId,
+      createdAt: ordersMap.CreatedAt
+        ? isoDate_(lastOrderRow[ordersMap.CreatedAt - 1])
+        : '',
+      items: lastOrderItems
+    }
+    : null;
+
+  return { ok: true, frequent, lastOrder };
+}
+
+/**
+ * The customer's newest order that was not cancelled. Rows are appended in
+ * time order, so a later row wins whenever CreatedAt cannot be read.
+ */
+function findLastOrderRow_(rows, map) {
+  let latest = null;
+  let latestTime = -Infinity;
+
+  rows.forEach(row => {
+    if (map.status && isCancelledStatus_(row[map.status - 1])) return;
+    const time = map.CreatedAt ? dateValue_(row[map.CreatedAt - 1]) : NaN;
+    const comparable = Number.isFinite(time) ? time : latestTime;
+    if (comparable >= latestTime) {
+      latest = row;
+      latestTime = comparable;
+    }
+  });
+
+  return latest;
+}
+
+function isCancelledStatus_(value) {
+  return ['CANCELLED', 'CANCELED', 'VOID'].includes(text_(value).toUpperCase());
+}
+
+function dateValue_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') return value.getTime();
+  const text = text_(value);
+  return text ? new Date(text).getTime() : NaN;
+}
+
+function isoDate_(value) {
+  const time = dateValue_(value);
+  return Number.isFinite(time) ? new Date(time).toISOString() : text_(value);
+}
+
+/* =========================
+ * BEST SELLERS
+ * ========================= */
+
+const BEST_SELLER_DAYS = 30;
+const BEST_SELLER_LIMIT = 5;
+const BEST_SELLER_CACHE_KEY = 'bestSellers:v1';
+const BEST_SELLER_CACHE_SECONDS = 6 * 60 * 60;
+
+/**
+ * SKUs that sold the most units over the last 30 days, best first. Only SKUs
+ * leave the server, never quantities. Cached because the catalog is public and
+ * would otherwise read the whole Orders and OrderItems sheets on every miss.
+ */
+function safeBestSellers_() {
+  try {
+    const cache = CacheService.getScriptCache();
+    const cached = cache.get(BEST_SELLER_CACHE_KEY);
+    if (cached) return JSON.parse(cached);
+
+    const skus = calculateBestSellers_(new Date(), BEST_SELLER_DAYS, BEST_SELLER_LIMIT);
+    cache.put(BEST_SELLER_CACHE_KEY, JSON.stringify(skus), BEST_SELLER_CACHE_SECONDS);
+    return skus;
+  } catch (err) {
+    console.error('bestSellers failed: ' + errorMessage_(err));
+    return [];
+  }
+}
+
+function calculateBestSellers_(now, days, limit) {
+  const since = now.getTime() - days * 24 * 60 * 60 * 1000;
+
+  const { sheet: ordersSheet, map: ordersMap } = assertHeaders_('Orders', ['OrderID', 'CreatedAt']);
+  if (ordersSheet.getLastRow() < 2) return [];
+
+  const recentOrderIds = new Set();
+  ordersSheet
+    .getRange(2, 1, ordersSheet.getLastRow() - 1, ordersSheet.getLastColumn())
+    .getValues()
+    .forEach(row => {
+      if (ordersMap.status && isCancelledStatus_(row[ordersMap.status - 1])) return;
+      if (!(dateValue_(row[ordersMap.CreatedAt - 1]) >= since)) return;
+      recentOrderIds.add(text_(row[ordersMap.OrderID - 1]));
+    });
+
+  if (!recentOrderIds.size) return [];
+
+  const { sheet: itemsSheet, map: itemsMap } = assertHeaders_(
+    'OrderItems',
+    ['OrderID', 'Brand', 'Name', 'qty']
+  );
+  if (itemsSheet.getLastRow() < 2) return [];
+
+  const index = buildProductIndex_();
+  const units = new Map();
+
+  itemsSheet
+    .getRange(2, 1, itemsSheet.getLastRow() - 1, itemsSheet.getLastColumn())
+    .getValues()
+    .forEach(row => {
+      if (!recentOrderIds.has(text_(row[itemsMap.OrderID - 1]))) return;
+      const sku = findProductSku_({
+        SKU: itemsMap.SKU ? row[itemsMap.SKU - 1] : '',
+        Brand: row[itemsMap.Brand - 1],
+        Size: itemsMap.Size ? row[itemsMap.Size - 1] : '',
+        Name: row[itemsMap.Name - 1]
+      }, index);
+      if (!sku) return;
+      units.set(sku, (units.get(sku) || 0) + toNumber_(row[itemsMap.qty - 1]));
+    });
+
+  return Array.from(units.entries())
+    .filter(([, quantity]) => quantity > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([sku]) => sku);
+}
+
+/** Inactive or deleted products are not in the index and simply drop out. */
+function findProductSku_(item, index) {
+  try {
+    return resolveProduct_(item, index).SKU || '';
+  } catch (_) {
+    return '';
+  }
 }
 
 /* =========================
